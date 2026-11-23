@@ -38,9 +38,14 @@ The `.dat` files are only needed with `thermo = nasa`.
 |---|---|
 | `hit_modes.dat` | `compHIT_direct_Re_lamda_100/LLF/hit_modes.dat` (same file for LLF and HLLC) |
 | `aa.dat`, `h0.dat`, `s0.dat` | thermo refit files the Fortran `usrdat` reads (air1.yaml, O2 then N2) |
-| `mw.dat` | molar masses in g/mol, one per line, same species order (Cantera `getmolecularweights`) |
+| mesh | `dgCompHIT.re2`, see [Mesh](#mesh) |
+`mw.dat` is already in this directory: molar masses in g/mol, one per line, O2 then N2 (31.998, 28.014, the values Cantera's `getmolecularweights` returns). Its order must match `aa.dat`, `h0.dat` and `s0.dat`. To check the order, or to write it for another mechanism:
 
-`mw.dat` is temporary. It goes away once the Cantera host bridge (M2) supplies the molar masses.
+```bash
+python -c "import cantera as ct; g = ct.Solution('air1.yaml'); print(g.species_names); print(*g.molecular_weights, sep='\n')"
+```
+
+The CompNek5000 run also prints the order at startup (`species       mol wt`). `mw.dat` is temporary. It goes away once the Cantera host bridge (M2) supplies the molar masses. No `.yaml` file is read at run time.
 
 ## Mesh
 

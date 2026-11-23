@@ -41,8 +41,9 @@ None of this code has been compiled yet.
 | T-10 | Checkpoint fields: named with ADIOS (`density`, `Y_O2`, ...), numbered with .fld | M1 | done | - | 7b2cc73d | |
 | T-11 | `dgCompHIT` case: par, udf, Fourier IC kernel, mesh rescale, `input.box`, README | M2 | done | - | 7b2cc73d | |
 | T-12 | `dgCompHIT` `[CASEDATA]`: boxLength, T0, p0, Y0 | M2 | done | - | 3084e452 | Read in `UDF_Setup0`. Replaces the constants that were hard-coded in the udf |
-| T-45 | Single-component perfect gas as the default: `[DGCOMP] thermo = perfectGas` (gamma, gasConstant) or `nasa`; `p_perfectGas` kernel branch; `dgComp::setup()` with no arguments; Y optional when nspec = 1 | M1 | done | - | uncommitted | DG solver first, multi-species second. nspec = 1 skips the Y output |
-| T-46 | `dgCompHIT.udf`: direct `par->extract` calls in `UDF_Setup0`, checks in `checkCaseData()`; runs with either thermo | M2 | done | - | uncommitted | Same pattern as `mv_cyl` |
+| T-45 | Single-component perfect gas as the default: `[DGCOMP] thermo = perfectGas` (gamma, gasConstant) or `nasa`; `p_perfectGas` kernel branch; `dgComp::setup()` with no arguments; Y optional when nspec = 1 | M1 | done | - | 9953dc2a | DG solver first, multi-species second. nspec = 1 skips the Y output |
+| T-46 | `dgCompHIT.udf`: direct `par->extract` calls in `UDF_Setup0`, checks in `checkCaseData()`; runs with either thermo | M2 | done | - | 9953dc2a | Same pattern as `mv_cyl` |
+| T-47 | `[DGCOMP]` section in `doc/parHelp.txt`; `mw.dat` (O2, N2) shipped with `dgCompHIT` | - | done | - | this commit | |
 
 ## 2. Pending (current: M0 and M1)
 
@@ -52,7 +53,7 @@ None of this code has been compiled yet.
 | T-14 | Separate `dg_dev` install on Polaris, run `examples/ethier` | M0 | todo | Prefix `$HOME/.local/nekrs-dg-polaris` |
 | T-15 | Separate `dg_dev` install on Aurora, run `examples/ethier` | M0 | todo | Prefix `$HOME/.local/nekrs-dg-aurora` |
 | T-16 | Module and env scripts per machine under `doc/dg/` | M0 | todo | |
-| T-17 | Compile `dgCompHIT`, run the M0 stub; the field should stay unchanged | M0 | todo | Also needs `hit_modes.dat`, `aa/h0/s0/mw.dat` copied in |
+| T-17 | Compile `dgCompHIT`, run the M0 stub; the field should stay unchanged | M0 | todo | Also needs `hit_modes.dat`, `aa/h0/s0.dat` and the mesh copied in (`mw.dat` is in the example) |
 | T-18 | KEP and EC flux-differencing volume kernel (`advect_volInt`) | M1 | todo | Main performance kernel |
 | T-19 | LLF and HLLC surface flux, lift (`advect_interface`, `riemann.f`) | M1 | todo | |
 | T-20 | CFL and adaptive dt (`compcfl.f`) | M1 | todo | |

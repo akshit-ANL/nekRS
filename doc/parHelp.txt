@@ -269,7 +269,61 @@ dealiasing                  true, false
 ----------------------------------------------------------------------------------------------------------------------
 [ELLIPTIC FOO]
 vectorField                 true, false [D]
-poisson                     true, flase [D] 
+poisson                     true, flase [D]
+
+----------------------------------------------------------------------------------------------------------------------
+[DGCOMP]                                                               optional, compressible DGSEM plugin
+                                                                       read only if the udf includes dgComp.hpp
+                                                                       must be listed in userSections if present
+                                                                       every key is optional for thermo = perfectGas
+
+thermo                      perfectGas [D], nasa                       perfectGas: single component, constant gamma
+                                                                       nasa: mixture, NASA cp fits per species
+
+gamma                       <float>                                    ratio of specific heats (perfectGas only)
+                            1.4 [D]
+
+gasConstant                 <float>                                    specific gas constant R in J/(kg K)
+                            287.0 [D]                                  (perfectGas only)
+
+nspec                       <int>                                      number of species
+                            1 [D]                                      perfectGas: must be 1
+                                                                       nasa: mandatory
+
+npa                         <int>                                      cp polynomial coefficients per species
+                            5 [D]                                      (nasa only)
+
+species                     <string>, <string>, ...                    species names for output (Y_O2, Y_N2, ...)
+                            Y_00, Y_01, ... [D]                        same order as aa.dat/h0.dat/s0.dat/mw.dat
+
+riemannSolver               llf [D], hllc                              interface flux
+
+volumeFlux                  kep [D], ec                                kinetic-energy preserving or entropy conserving
+
+viscous                     true, false [D]
+reacting                    true, false [D]
+splitChemistry              true, false [D]                            Strang-split chemistry when reacting
+clip                        true, false [D]                            clip T in the Newton solve
+positivityLimiter           true, false [D]                            Zhang-Shu
+artificialViscosity         true, false [D]                            entropy viscosity
+fullInterfaceLLF            true, false [D]
+
+dtChem                      <float>                                    chemistry sub-step (userparam01)
+                                                                       must be > 0 if reacting = true
+
+avCstar                     <float>                                    entropy viscosity c* (userparam02)
+                            1.0 [D]
+avCmax                      <float>                                    entropy viscosity cmax (userparam03)
+                            0.3 [D]
+avP                         <float>                                    entropy viscosity P (userparam04)
+                            0.7 [D]
+
+thermo = nasa reads these files from the case directory, nspec per file in species order (all mandatory):
+  aa.dat                    nspec*npa values, species by species       cp_k(T) = sum_c aa[c] T^c, J/(kg K)
+  h0.dat                    nspec values                               enthalpy at 298.15 K, J/kg
+  s0.dat                    nspec values                               entropy at 298.15 K and 101325 Pa, J/(kg K)
+  mw.dat                    nspec values                               molar mass, g/mol
+Fortran D exponents and commas are accepted. No Cantera mechanism (.yaml) is read at run time.
 
 ----------------------------------------------------------------------------------------------------------------------
 
