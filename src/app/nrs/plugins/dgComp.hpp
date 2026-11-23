@@ -24,6 +24,13 @@
 //   artificialViscosity = no  # ifavisc
 //   fullInterfaceLLF = no     # ifIntLLFfull
 //   species = O2, N2          # optional, names the Y_k output fields
+//   dtChem = 2e-9             # chemistry sub-step      (userparam01), reacting only
+//   avCstar = 1.0             # entropy viscosity c*    (userparam02)
+//   avCmax = 0.3              # entropy viscosity cmax  (userparam03)
+//   avP = 0.7                 # entropy viscosity P     (userparam04)
+//
+// Case-specific inputs (box size, initial state, ...) belong in the case's
+// own [CASEDATA] section and are read by the .udf, not by the plugin.
 //
 // The kernels are compiled with the species count baked in (p_Nspec), so
 // buildKernel reads [DGCOMP] nspec/npa before setup() is called.

@@ -15,6 +15,12 @@ It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 - This exercises setup, the EOS/Newton primitives, the face exchange, SSPRK3 and checkpointing, not the physics.
 - Viscous terms (M2) are not implemented, so `viscous = no` for now.
 
+## Parameters
+
+The par file has two user sections:
+- `[DGCOMP]` is read by the plugin: species, flux choices, feature switches, and CompNek5000 `userparam01..05` (`dtChem`, `avCstar`, `avCmax`, `avP`, `riemannSolver`).
+- `[CASEDATA]` is read by `dgCompHIT.udf`: `boxLength`, `T0`, `p0` and `Y0` (one mass fraction per species, summing to 1). These used to be hard-coded in `base.usr`.
+
 ## Files to copy in from the CompNek5000 case
 
 | file | source |

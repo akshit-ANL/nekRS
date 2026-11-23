@@ -43,6 +43,12 @@ struct options_t {
   bool positivityLimiter = false;
   bool artificialViscosity = false;
   bool fullInterfaceLLF = false;
+
+  // CompNek5000 userparam01..04 (base.par of compHIT)
+  dfloat dtChem = 0;    // uparam(1), chemistry sub-step (M4)
+  dfloat avCstar = 1.0; // uparam(2), entropy-viscosity c*  (M3)
+  dfloat avCmax = 0.3;  // uparam(3), entropy-viscosity cmax (M3)
+  dfloat avP = 0.7;     // uparam(4), entropy-viscosity P   (M3)
 } opt;
 
 occa::memory o_Ucons; // conserved state
@@ -120,6 +126,18 @@ void readOptions()
   opt.positivityLimiter = parFlag("positivitylimiter", false);
   opt.artificialViscosity = parFlag("artificialviscosity", false);
   opt.fullInterfaceLLF = parFlag("fullinterfacellf", false);
+
+  // keys missing from the par file keep the defaults above
+  platform->par->extract("dgcomp", "dtchem", opt.dtChem);
+  platform->par->extract("dgcomp", "avcstar", opt.avCstar);
+  platform->par->extract("dgcomp", "avcmax", opt.avCmax);
+  platform->par->extract("dgcomp", "avp", opt.avP);
+
+  nekrsCheck(opt.reacting && opt.dtChem <= 0,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "[DGCOMP] reacting = yes needs dtChem > 0 (CompNek5000 userparam01)");
 }
 
 // [DGCOMP] species = O2, N2 (comma or space separated). The par reader
@@ -394,6 +412,17 @@ void dgComp::setup(const thermo_t &th)
            opt.riemannSolver ? "hllc" : "llf",
            opt.volumeFlux ? "ec" : "kep",
            opt.clip);
+    printf("dgComp: viscous=%d reacting=%d splitChemistry=%d dtChem=%g\n",
+           opt.viscous,
+           opt.reacting,
+           opt.splitChemistry,
+           opt.dtChem);
+    printf("dgComp: positivityLimiter=%d artificialViscosity=%d avCstar=%g avCmax=%g avP=%g\n",
+           opt.positivityLimiter,
+           opt.artificialViscosity,
+           opt.avCstar,
+           opt.avCmax,
+           opt.avP);
   }
 
   setupCalled = true;

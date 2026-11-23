@@ -155,6 +155,8 @@ Cantera is a host-only C++ library and cannot run inside OCCA kernels. Calling i
 
 ## 4. Milestones
 
+The status of each item, plus case ideas and bug reports, is tracked in [TRACKER.md](TRACKER.md).
+
 | # | Goal | Done when |
 |---|---|---|
 | 0 | Baseline | A separate `dg_dev` install (§5) builds and runs `examples/ethier` on Polaris (CUDA) and Aurora (DPCPP). Module and env scripts are committed under `doc/dg/`. |

@@ -1,6 +1,6 @@
 # Compressible HIT, Re_lambda = 100, Mt = 0.6, air (O2/N2), DGSEM plugin.
 # nekRS port of CompNek5000 compHIT_direct_Re_lamda_100 (see README.md).
-userSections = DGCOMP
+userSections = DGCOMP, CASEDATA
 
 [GENERAL]
 polynomialOrder = 7        # CompNek5000 lx1 = 8
@@ -31,3 +31,14 @@ clip = no
 positivityLimiter = no
 artificialViscosity = no
 fullInterfaceLLF = no
+dtChem = 2.0e-9            # userparam01, used once reacting = yes (M4)
+avCstar = 1.0              # userparam02, entropy viscosity (M3)
+avCmax = 0.3               # userparam03
+avP = 0.7                  # userparam04
+
+# case inputs, read by dgCompHIT.udf (not by the plugin)
+[CASEDATA]
+boxLength = 1.6467320829664873e-4   # base.usr L0 [m]
+T0 = 300.0                 # [K]
+p0 = 1.0e5                 # [Pa]
+Y0 = 0.23, 0.77            # same order as species
