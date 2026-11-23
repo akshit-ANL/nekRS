@@ -32,7 +32,7 @@ None of this code has been compiled yet.
 | T-01 | Porting roadmap (`doc/dg/ROADMAP.md`) | - | done | - | 56afba11 | |
 | T-02 | Plugin skeleton: `dgComp.{hpp,cpp}`, `dgComp.okl`, `cmake/nekrs.cmake`, `pluginTable` autoload | M1 | done | - | 7b2cc73d | Including `dgComp.hpp` in a .udf calls `dgComp::buildKernel` |
 | T-03 | `[DGCOMP]` options: nspec, npa, flux choices, feature flags, species names | M1 | done | - | 7b2cc73d | Unimplemented features abort at setup |
-| T-04 | `[DGCOMP]` userparam01..04: `dtChem`, `avCstar`, `avCmax`, `avP` | M1 | done | - | uncommitted | Parsed and printed only; used from M3/M4 on |
+| T-04 | `[DGCOMP]` userparam01..04: `dtChem`, `avCstar`, `avCmax`, `avP` | M1 | done | - | 3084e452 | Parsed and printed only; used from M3/M4 on |
 | T-05 | Thermo input: `aa/h0/s0/mw.dat` reader, `bi` polynomials (`get_bi`) | M1 | done | - | 7b2cc73d | `mw.dat` is temporary until the Cantera bridge |
 | T-06 | Primitives kernel (EOS, Newton for T) and conserved-from-primitives kernel | M1 | done | - | 7b2cc73d | |
 | T-07 | Trace gather and face exchange (oogs on `globalFaceIds`, gives M+P) | M1 | done | - | 7b2cc73d | Periodic pairing not checked yet (T-13) |
@@ -40,7 +40,9 @@ None of this code has been compiled yet.
 | T-09 | Max wave speed reduction | M1 | done | - | 7b2cc73d | Not used for dt yet (T-20) |
 | T-10 | Checkpoint fields: named with ADIOS (`density`, `Y_O2`, ...), numbered with .fld | M1 | done | - | 7b2cc73d | |
 | T-11 | `dgCompHIT` case: par, udf, Fourier IC kernel, mesh rescale, `input.box`, README | M2 | done | - | 7b2cc73d | |
-| T-12 | `dgCompHIT` `[CASEDATA]`: boxLength, T0, p0, Y0 | M2 | done | - | uncommitted | Read in `UDF_Setup0`. Replaces the constants that were hard-coded in the udf |
+| T-12 | `dgCompHIT` `[CASEDATA]`: boxLength, T0, p0, Y0 | M2 | done | - | 3084e452 | Read in `UDF_Setup0`. Replaces the constants that were hard-coded in the udf |
+| T-45 | Single-component perfect gas as the default: `[DGCOMP] thermo = perfectGas` (gamma, gasConstant) or `nasa`; `p_perfectGas` kernel branch; `dgComp::setup()` with no arguments; Y optional when nspec = 1 | M1 | done | - | uncommitted | DG solver first, multi-species second. nspec = 1 skips the Y output |
+| T-46 | `dgCompHIT.udf`: direct `par->extract` calls in `UDF_Setup0`, checks in `checkCaseData()`; runs with either thermo | M2 | done | - | uncommitted | Same pattern as `mv_cyl` |
 
 ## 2. Pending (current: M0 and M1)
 
@@ -86,8 +88,8 @@ None of this code has been compiled yet.
 | ID | Case | Purpose | Source | Needs | Status |
 |---|---|---|---|---|---|
 | C-01 | `dgCompHIT` (Re_lambda=100, Mt=0.6) | Main 3D validation | `compHIT_direct_Re_lamda_100/LLF` | M1 (inviscid), M2 (full) | wip |
-| C-02 | `tgvComp` | Optional bring-up, analytic IC | CompNek5000 `tgvComp` | M1 | todo |
-| C-03 | Isentropic vortex | Convergence order | new | M1 | todo |
+| C-02 | `tgvComp` | Optional bring-up, analytic IC; `thermo = perfectGas` | CompNek5000 `tgvComp` | M1 | todo |
+| C-03 | Isentropic vortex | Convergence order; `thermo = perfectGas` | new | M1 | todo |
 | C-04 | `dmr2d`, extruded one element in z | Shocks, BCs, limiter | CompNek5000 `dmr2d` | M3 | todo |
 | C-05 | `det2d`, extruded (H2, 10 species) | Reacting | CompNek5000 `det2d` | M4 | todo |
 | C-06 | HIT at 64^3 and 128^3 | Weak scaling | C-01 | M5 | todo |

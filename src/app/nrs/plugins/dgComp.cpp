@@ -11,7 +11,8 @@
 
 #include "dgComp.hpp"
 
-// Status (M0 scaffold): state allocation, primitives (EOS + Newton for T),
+// Status (M0 scaffold): state allocation, primitives (perfect gas, or NASA
+// mixture with Newton for T),
 // trace gather and face exchange, SSPRK3 and the wave-speed reduction work.
 // The volume and surface RHS kernels are stubs that return zero, so a run
 // should leave the solution unchanged. See doc/dg/ROADMAP.md, M1.
@@ -23,6 +24,11 @@ constexpr dfloat Ru = 8.3144598; // J/(mol K), same value as CompNek5000
 
 nrs_t *_nrs = nullptr;
 mesh_t *mesh = nullptr;
+
+// [DGCOMP] thermo = perfectGas (single component, default) | nasa (mixture)
+bool isPerfectGas = true;
+dfloat gammaGas = 1.4; // perfectGas only
+dfloat Rgas = 287.0;   // perfectGas only, J/(kg K)
 
 int nspec = 0;
 int npa = 5;
@@ -206,6 +212,30 @@ std::vector<dfloat> computeBi(const dgComp::thermo_t &th)
   return bi;
 }
 
+// Single species with constant cp = gamma R/(gamma-1) and W = Ru/R, so the
+// shared EOS code gives p = rho R T. bi is set directly in setupImpl.
+dgComp::thermo_t perfectGasThermo()
+{
+  dgComp::thermo_t th;
+  th.npa = 1;
+  th.aa = {gammaGas * Rgas / (gammaGas - 1)};
+  th.h0 = {0};
+  th.s0 = {0};
+  th.mw = {Ru / Rgas};
+  return th;
+}
+
+void setupImpl(const dgComp::thermo_t &th); // defined after dgComp::setup
+
+void checkBuilt()
+{
+  nekrsCheck(!buildKernelCalled,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp::buildKernel was not called (include dgComp.hpp in the .udf)");
+}
+
 bool checkpointFieldsAdded = false;
 
 bool writeThroughFluid()
@@ -280,12 +310,40 @@ dgComp::thermo_t dgComp::readThermo(const std::string &caseDir, int ns, int na)
 
 void dgComp::buildKernel(occa::properties kernelInfo)
 {
-  nekrsCheck(!platform->par->extract("dgcomp", "nspec", nspec) || nspec < 1,
+  const auto thermo = parString("thermo", "perfectgas");
+  nekrsCheck(thermo != "perfectgas" && thermo != "nasa",
              platform->comm.mpiComm(),
              EXIT_FAILURE,
-             "%s\n",
-             "[DGCOMP] nspec is missing (add userSections = DGCOMP to the par file)");
-  platform->par->extract("dgcomp", "npa", npa);
+             "[DGCOMP] thermo = %s is not supported (perfectGas | nasa)\n",
+             thermo.c_str());
+  isPerfectGas = (thermo == "perfectgas");
+
+  if (isPerfectGas) {
+    nspec = 1;
+    platform->par->extract("dgcomp", "nspec", nspec);
+    nekrsCheck(nspec != 1,
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "%s\n",
+               "[DGCOMP] thermo = perfectGas is single-component, nspec must be 1 (use thermo = nasa for "
+               "mixtures)");
+    npa = 1; // cp constant
+    platform->par->extract("dgcomp", "gamma", gammaGas);
+    platform->par->extract("dgcomp", "gasconstant", Rgas);
+    nekrsCheck(!(gammaGas > 1) || !(Rgas > 0),
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "[DGCOMP] perfectGas needs gamma > 1 and gasConstant > 0 (got %g, %g)\n",
+               gammaGas,
+               Rgas);
+  } else {
+    nekrsCheck(!platform->par->extract("dgcomp", "nspec", nspec) || nspec < 1,
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "%s\n",
+               "[DGCOMP] thermo = nasa needs nspec (and userSections = DGCOMP in the par file)");
+    platform->par->extract("dgcomp", "npa", npa);
+  }
 
   nEq = 4 + nspec;
   nPrim = prim::Y0 + nspec;
@@ -297,6 +355,9 @@ void dgComp::buildKernel(occa::properties kernelInfo)
   kernelInfo["defines/p_Nprim"] = nPrim;
   kernelInfo["defines/p_Ntrace"] = nTrace;
   kernelInfo["defines/p_Ru"] = Ru;
+  kernelInfo["defines/p_perfectGas"] = isPerfectGas ? 1 : 0;
+  kernelInfo["defines/p_gamma"] = gammaGas;
+  kernelInfo["defines/p_cv"] = Rgas / (gammaGas - 1);
 
   kernelInfo["defines/p_PRHO"] = prim::RHO;
   kernelInfo["defines/p_PU"] = prim::U;
@@ -332,18 +393,38 @@ void dgComp::buildKernel(occa::properties kernelInfo)
   waveSpeedKernel = buildKernel("dgWaveSpeed");
 }
 
+void dgComp::setup()
+{
+  if (setupCalled) {
+    return;
+  }
+  checkBuilt();
+  setupImpl(isPerfectGas ? perfectGasThermo() : readThermo(".", nspec, npa));
+}
+
 void dgComp::setup(const thermo_t &th)
 {
   if (setupCalled) {
     return;
   }
-
-  nekrsCheck(!buildKernelCalled,
+  checkBuilt();
+  nekrsCheck(isPerfectGas,
              platform->comm.mpiComm(),
              EXIT_FAILURE,
              "%s\n",
-             "dgComp::buildKernel was not called (include dgComp.hpp in the .udf)");
+             "dgComp::setup(thermo) needs [DGCOMP] thermo = nasa; use dgComp::setup() for a perfect gas");
+  setupImpl(th);
+}
 
+bool dgComp::perfectGas()
+{
+  return isPerfectGas;
+}
+
+namespace
+{
+void setupImpl(const dgComp::thermo_t &th)
+{
   _nrs = dynamic_cast<nrs_t *>(platform->app);
   mesh = _nrs->meshV;
   fieldOffset = _nrs->fieldOffset;
@@ -383,7 +464,8 @@ void dgComp::setup(const thermo_t &th)
   platform->linAlg->fill(nPrim * fieldOffset, 0.0, o_primv); // T = 0 -> Newton starts at 500 K
   platform->linAlg->fill(nTrace * faceOffset, 0.0, o_faceM);
 
-  const auto bi = computeBi(th);
+  // perfect gas: u(T) = cv T exactly, matching p_cv in dgPrimitives
+  const auto bi = isPerfectGas ? std::vector<dfloat>{0, Rgas / (gammaGas - 1)} : computeBi(th);
   o_bi = platform->device.malloc<dfloat>(bi.size());
   o_bi.copyFrom(bi.data());
   o_aa = platform->device.malloc<dfloat>(th.aa.size());
@@ -405,6 +487,11 @@ void dgComp::setup(const thermo_t &th)
                         OOGS_AUTO);
 
   if (platform->comm.mpiRank() == 0) {
+    if (isPerfectGas) {
+      printf("dgComp: thermo=perfectGas gamma=%g R=%g J/(kg K)\n", gammaGas, Rgas);
+    } else {
+      printf("dgComp: thermo=nasa\n");
+    }
     printf("dgComp: nspec=%d npa=%d nEq=%d riemann=%s volumeFlux=%s clip=%d\n",
            nspec,
            npa,
@@ -427,6 +514,7 @@ void dgComp::setup(const thermo_t &th)
 
   setupCalled = true;
 }
+} // namespace
 
 void dgComp::setSolution(const std::vector<dfloat> &U)
 {
@@ -448,6 +536,22 @@ std::vector<dfloat> dgComp::conservedFromPrimitives(const std::vector<dfloat> &v
 {
   checkReady("conservedFromPrimitives");
 
+  nekrsCheck(Y.empty() && nspec != 1,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "dgComp::conservedFromPrimitives: Y is required with nspec = %d\n",
+             nspec);
+  std::vector<dfloat> ones;
+  if (Y.empty()) {
+    ones.assign(fieldOffset, 1.0);
+  }
+  const auto &Yk = Y.empty() ? ones : Y;
+  nekrsCheck(Yk.size() < static_cast<size_t>(nspec * fieldOffset),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp::conservedFromPrimitives: Y must hold nspec*fieldOffset values");
+
   auto o_vel = platform->deviceMemoryPool.reserve<dfloat>(3 * fieldOffset);
   auto o_p = platform->deviceMemoryPool.reserve<dfloat>(fieldOffset);
   auto o_T = platform->deviceMemoryPool.reserve<dfloat>(fieldOffset);
@@ -455,7 +559,7 @@ std::vector<dfloat> dgComp::conservedFromPrimitives(const std::vector<dfloat> &v
   o_vel.copyFrom(vel.data(), 3 * fieldOffset);
   o_p.copyFrom(p.data(), fieldOffset);
   o_T.copyFrom(T.data(), fieldOffset);
-  o_Y.copyFrom(Y.data(), nspec * fieldOffset);
+  o_Y.copyFrom(Yk.data(), nspec * fieldOffset);
 
   auto o_Utmp = platform->deviceMemoryPool.reserve<dfloat>(nEq * fieldOffset);
   conservedKernel(mesh->Nlocal, fieldOffset, o_mw, o_bi, o_vel, o_p, o_T, o_Y, o_Utmp);
@@ -510,13 +614,16 @@ void dgComp::addCheckpointFields(const std::vector<std::string> &speciesNames)
     return;
   }
 
+  // single component: Y = 1 everywhere, not worth writing
+  const int nY = (nspec == 1) ? 0 : nspec;
+
   auto names = speciesNames.empty() ? speciesNamesFromPar() : speciesNames;
   if (names.empty()) {
-    for (int k = 0; k < nspec; k++) {
+    for (int k = 0; k < nY; k++) {
       names.push_back(scalarDigitStr(k));
     }
   }
-  nekrsCheck(names.size() != static_cast<size_t>(nspec),
+  nekrsCheck(nY > 0 && names.size() != static_cast<size_t>(nspec),
              platform->comm.mpiComm(),
              EXIT_FAILURE,
              "dgComp: %zu species names given, nspec = %d\n",
@@ -526,12 +633,12 @@ void dgComp::addCheckpointFields(const std::vector<std::string> &speciesNames)
   // The nek (.fld) writer only accepts velocity/pressure/temperature and
   // scalarNN, so named fields need checkpointEngine = adios.
   const bool namedFields = platform->options.compareArgs("CHECKPOINT ENGINE", "ADIOS");
-  nekrsCheck(!namedFields && nspec + 1 > NSCALAR_MAX,
+  nekrsCheck(!namedFields && nY + 1 > NSCALAR_MAX,
              platform->comm.mpiComm(),
              EXIT_FAILURE,
              "dgComp: density + %d mass fractions exceed the %d scalars of the .fld format, use "
              "checkpointEngine = adios\n",
-             nspec,
+             nY,
              NSCALAR_MAX);
 
   auto slice = [](int f) {
@@ -551,7 +658,7 @@ void dgComp::addCheckpointFields(const std::vector<std::string> &speciesNames)
 
   // scalar fields: density, then one mass fraction per species
   std::vector<std::pair<std::string, int>> scalars = {{"density", prim::RHO}};
-  for (int k = 0; k < nspec; k++) {
+  for (int k = 0; k < nY; k++) {
     scalars.push_back({"Y_" + names[k], prim::Y0 + k});
   }
 

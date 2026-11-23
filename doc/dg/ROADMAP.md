@@ -68,6 +68,10 @@ Source being ported: `CompNek5000/src/*.f` (about 4.3k lines of Fortran) plus `c
 ### 2.4 Data layout and geometry
 - Conserved state: `o_U[N_EQ * fieldOffset]`. Primitives: `o_rho, o_vel(3), o_p, o_T, o_h, o_gamma, o_c, o_Y(nspec), o_s …`.
 - Kernel defines: `p_Nspec`, `p_Neq`, `p_Npa`, plus the mesh defines `p_Nq`, `p_Np`, `p_Nfp`.
+- Thermo model, a compile-time branch (`p_perfectGas`), chosen with `[DGCOMP] thermo`:
+  - `perfectGas` (default): one component, constant `gamma` and `gasConstant`, closed-form T. nspec = 1, so field 4 is rho. This makes the plugin a general single-component compressible DG solver.
+  - `nasa`: the CompNek5000 multi-species mixture with NASA cp fits and Newton for T.
+  - Both share the same state layout, so the flux kernels are written once.
 - Geometry:
   - volume metrics from `o_vgeo` (RX..TZ, JID, JWID);
   - face normals and area weights from `o_sgeo` (NXID.., WSJID);

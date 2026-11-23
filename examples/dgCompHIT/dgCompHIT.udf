@@ -1,21 +1,22 @@
 // Compressible HIT with the dgComp plugin (port of CompNek5000 compHIT).
 //
-// Initial condition, as in base.usr useric: uniform T0, p0, Y0 from
-// [CASEDATA] (air: 300 K, 1e5 Pa, O2/N2 = 0.23/0.77), velocity from the
-// Fourier modes in hit_modes.dat
+// Initial condition, as in base.usr useric: uniform T0, p0 (and Y0 for a
+// mixture) from [CASEDATA], velocity from the Fourier modes in hit_modes.dat
 //   u(x) = sum_m a_m cos(2 pi n_m.x / L) + b_m sin(2 pi n_m.x / L)
+//
+// Runs with either [DGCOMP] thermo: perfectGas (single component, Y0 not
+// needed) or nasa (the CompNek5000 reference, air as O2/N2 = 0.23/0.77).
 
 #include <algorithm>
 #include <fstream>
-#include <sstream>
 
 #include "dgComp.hpp"
 
-// [CASEDATA] in dgCompHIT.par, read in readCaseData()
+// [CASEDATA], read in UDF_Setup0
 static dfloat L = 0;           // boxLength, base.usr L0 [m]
 static dfloat T0 = 0;          // T0 [K]
 static dfloat p0 = 0;          // p0 [Pa]
-static std::vector<dfloat> Y0; // Y0, one mass fraction per species
+static std::vector<dfloat> Y0; // Y0, one mass fraction per species (nasa only)
 
 #ifdef __okl__
 
@@ -53,31 +54,33 @@ static std::vector<dfloat> Y0; // Y0, one mass fraction per species
 
 #endif
 
-// Called from UDF_Setup0, before kernels are built and before dgComp knows
-// nspec, so the Y0 length is checked later in UDF_Setup.
-static void readCaseData()
+// Sanity checks on [CASEDATA]. Called from UDF_Setup, once dgComp knows nspec.
+static void checkCaseData(int nspec)
 {
-  auto required = [](const std::string &key, dfloat &val) {
-    nekrsCheck(!platform->par->extract("casedata", key, val) || !(val > 0),
+  auto positive = [](const char *key, dfloat val) {
+    nekrsCheck(!(val > 0),
                platform->comm.mpiComm(),
                EXIT_FAILURE,
                "[CASEDATA] %s is missing or not positive\n",
-               key.c_str());
+               key);
   };
-  required("boxlength", L);
-  required("t0", T0);
-  required("p0", p0);
+  positive("boxLength", L);
+  positive("T0", T0);
+  positive("p0", p0);
 
-  std::string list;
-  platform->par->extract("casedata", "y0", list);
-  std::replace(list.begin(), list.end(), ',', ' ');
-  std::istringstream is(list);
-  Y0.clear();
-  for (double y; is >> y;) {
-    Y0.push_back(y);
+  if (nspec == 1) {
+    return; // Y = 1, Y0 is ignored
   }
+
+  nekrsCheck(Y0.size() != static_cast<size_t>(nspec),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "[CASEDATA] Y0 has %zu values, [DGCOMP] nspec = %d\n",
+             Y0.size(),
+             nspec);
   dfloat sumY = 0;
   for (auto y : Y0) {
+    nekrsCheck(y < 0, platform->comm.mpiComm(), EXIT_FAILURE, "[CASEDATA] Y0 has a negative value %g\n", y);
     sumY += y;
   }
   nekrsCheck(std::abs(sumY - 1) > 1e-10,
@@ -85,14 +88,21 @@ static void readCaseData()
              EXIT_FAILURE,
              "[CASEDATA] Y0 sums to %g, not 1\n",
              sumY);
+}
 
-  if (platform->comm.mpiRank() == 0) {
-    std::cout << "dgCompHIT: L = " << L << " m, T0 = " << T0 << " K, p0 = " << p0 << " Pa, Y0 =";
+static void printCaseData(int nspec)
+{
+  if (platform->comm.mpiRank() != 0) {
+    return;
+  }
+  std::cout << "dgCompHIT: L = " << L << " m, T0 = " << T0 << " K, p0 = " << p0 << " Pa";
+  if (nspec > 1) {
+    std::cout << ", Y0 =";
     for (auto y : Y0) {
       std::cout << " " << y;
     }
-    std::cout << std::endl;
   }
+  std::cout << std::endl;
 }
 
 // hit_modes.dat: number_of_modes / L urms k0 seed cutoff / nx ny nz ax ay az bx by bz ...
@@ -124,10 +134,19 @@ static std::vector<dfloat> readModes(const std::string &fileName)
 
 // Call order (src/lib/nekrs.cpp):
 //   UDF_Setup0 -> kernel build (UDF_LoadKernels, then dgComp::buildKernel,
-//   which reads [DGCOMP] nspec/npa) -> mesh and solver setup -> UDF_Setup
+//   which reads [DGCOMP] thermo/nspec/npa) -> mesh and solver setup -> UDF_Setup
 void UDF_Setup0(MPI_Comm comm, setupAide &options)
 {
-  readCaseData();
+  platform->par->extract("casedata", "boxlength", L);
+  platform->par->extract("casedata", "t0", T0);
+  platform->par->extract("casedata", "p0", p0);
+
+  std::string y0;
+  if (platform->par->extract("casedata", "y0", y0)) {
+    for (auto &&s : serializeString(y0, ',')) {
+      Y0.push_back(std::stod(s));
+    }
+  }
 }
 
 void UDF_Setup()
@@ -135,12 +154,8 @@ void UDF_Setup()
   auto mesh = nrs->meshV;
 
   const auto nspec = dgComp::Nspec();
-  nekrsCheck(Y0.size() != static_cast<size_t>(nspec),
-             platform->comm.mpiComm(),
-             EXIT_FAILURE,
-             "[CASEDATA] Y0 has %zu values, [DGCOMP] nspec = %d\n",
-             Y0.size(),
-             nspec);
+  checkCaseData(nspec);
+  printCaseData(nspec);
 
   // genbox mesh on [0,1]^3 -> [0,L]^3 (usrdat2). Recompute vgeo/sgeo now,
   // since dgComp uses them from the first step on.
@@ -149,7 +164,7 @@ void UDF_Setup()
   platform->linAlg->rescale(0.0, L, mesh->o_z, platform->comm.mpiComm());
   mesh->update();
 
-  dgComp::setup(dgComp::readThermo(".", nspec));
+  dgComp::setup(); // nasa: reads aa/h0/s0/mw.dat from the case directory
 
   if (platform->options.getArgs("RESTART FILE NAME").empty()) {
     const auto offset = nrs->fieldOffset;
@@ -166,9 +181,12 @@ void UDF_Setup()
 
     std::vector<dfloat> p(offset, p0);
     std::vector<dfloat> T(offset, T0);
-    std::vector<dfloat> Y(nspec * offset, 0.0);
-    for (int k = 0; k < nspec; k++) {
-      std::fill(Y.begin() + k * offset, Y.begin() + (k + 1) * offset, Y0[k]);
+    std::vector<dfloat> Y; // empty -> Y = 1 for a single component
+    if (nspec > 1) {
+      Y.resize(nspec * offset);
+      for (int k = 0; k < nspec; k++) {
+        std::fill(Y.begin() + k * offset, Y.begin() + (k + 1) * offset, Y0[k]);
+      }
     }
 
     dgComp::setSolution(dgComp::conservedFromPrimitives(vel, p, T, Y));

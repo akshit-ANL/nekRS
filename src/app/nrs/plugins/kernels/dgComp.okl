@@ -1,7 +1,9 @@
-// Compressible multi-species DGSEM kernels (port of CompNek5000).
+// Compressible DGSEM kernels (port of CompNek5000).
 //
 // Defines set by dgComp::buildKernel:
 //   p_Nspec, p_Npa, p_Neq (= 4 + p_Nspec), p_Nprim, p_Ntrace (= p_Neq + p_Nprim), p_Ru
+//   p_perfectGas (1: single component, constant gamma; 0: NASA polynomials),
+//   p_gamma, p_cv (perfect gas only)
 //   p_PRHO, p_PU, p_PV, p_PW, p_PP, p_PT, p_PGAMMA, p_PASPD, p_PH, p_PWMEAN, p_PY0
 //
 // Conserved fields (stride offset): 0..2 rho*u, 3 rho*E, 4.. rho*Y_k.
@@ -63,6 +65,11 @@
       const dfloat kinE = 0.5 * (u * u + v * v + w * w);
       const dfloat intE = U[n + 3 * offset] * invRho - kinE;
 
+#if p_perfectGas
+      // e = cv T, no Newton iteration needed
+      const dfloat T = intE / p_cv;
+      const dfloat gamma = p_gamma;
+#else
       // mixture coefficients: u(T) = sum_c b[c] T^c, cp(T) = sum_c a[c] T^c
       dfloat b[p_Npa + 1];
       dfloat a[p_Npa];
@@ -101,13 +108,15 @@
         T = p_Tclip;
       }
 
-      const dfloat p = rho * T * p_Ru / Wmean;
-
       dfloat cp = a[p_Npa - 1];
       for (int c = p_Npa - 2; c >= 0; c--) {
         cp = cp * T + a[c];
       }
       const dfloat gamma = cp / (cp - p_Ru / Wmean);
+#endif
+
+      // perfect gas: Wmean = Ru/R, so p = rho R T
+      const dfloat p = rho * T * p_Ru / Wmean;
 
       P[n + p_PRHO * offset] = rho;
       P[n + p_PU * offset] = u;
@@ -127,6 +136,8 @@
 }
 
 // Conserved variables from (velocity, p, T, Y), as in the CompNek5000 useric.
+// For a perfect gas the host sets bi = {0, cv} and mw = Ru/R, so the
+// polynomial below reduces to e = cv T and rho = p / (R T).
 @kernel void dgConserved(const dlong N,
                          const dlong offset,
                          @ restrict const dfloat *mw,

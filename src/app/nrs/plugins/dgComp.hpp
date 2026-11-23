@@ -1,8 +1,14 @@
 #if !defined(nekrs_dgComp_hpp_)
 #define nekrs_dgComp_hpp_
 
-// Compressible multi-species DGSEM plugin (port of CompNek5000).
+// Compressible DGSEM plugin (port of CompNek5000).
 // See doc/dg/ROADMAP.md for the design and milestones.
+//
+// Two thermodynamic models:
+//   thermo = perfectGas (default)  single-component calorically perfect gas,
+//                                  constant gamma and R, no species files
+//   thermo = nasa                  multi-species mixture, per-species NASA cp
+//                                  fits from aa/h0/s0/mw.dat (CompNek5000)
 //
 // The plugin owns its own state on meshV. The nekRS fluid solver should be
 // disabled in the .par file:
@@ -12,8 +18,11 @@
 //   solver = none
 //
 //   [DGCOMP]
-//   nspec = 2                 # number of species
-//   npa = 5                   # NASA polynomial coefficients per species
+//   thermo = perfectGas       # perfectGas | nasa
+//   gamma = 1.4               # perfectGas only
+//   gasConstant = 287.0       # perfectGas only, specific gas constant R [J/(kg K)]
+//   nspec = 2                 # nasa only (required): number of species
+//   npa = 5                   # nasa only: NASA polynomial coefficients per species
 //   riemannSolver = llf       # llf | hllc      (CompNek5000 userparam05 = 0 | 2)
 //   volumeFlux = kep          # kep | ec        (ifVolEC)
 //   viscous = yes             # ifviscous
@@ -23,7 +32,7 @@
 //   positivityLimiter = no    # ifpplim
 //   artificialViscosity = no  # ifavisc
 //   fullInterfaceLLF = no     # ifIntLLFfull
-//   species = O2, N2          # optional, names the Y_k output fields
+//   species = O2, N2          # nasa only, optional, names the Y_k output fields
 //   dtChem = 2e-9             # chemistry sub-step      (userparam01), reacting only
 //   avCstar = 1.0             # entropy viscosity c*    (userparam02)
 //   avCmax = 0.3              # entropy viscosity cmax  (userparam03)
@@ -32,13 +41,13 @@
 // Case-specific inputs (box size, initial state, ...) belong in the case's
 // own [CASEDATA] section and are read by the .udf, not by the plugin.
 //
-// The kernels are compiled with the species count baked in (p_Nspec), so
-// buildKernel reads [DGCOMP] nspec/npa before setup() is called.
+// The kernels are compiled with the thermo model and species count baked in
+// (p_perfectGas, p_Nspec), so buildKernel reads [DGCOMP] before setup().
 //
 // Conserved-variable layout, field stride = nrs->fieldOffset:
 //   0,1,2      rho*u, rho*v, rho*w   (CompNek5000 U_EQ..W_EQ)
 //   3          rho*E                 (E_EQ)
-//   4 .. 4+ns  rho*Y_k               (E_EQ+k)
+//   4 .. 4+ns  rho*Y_k               (E_EQ+k); perfectGas has ns = 1, field 4 = rho
 //
 // Primitive layout (see dgComp::prim):
 //   rho, u, v, w, p, T, gamma, a, h(=(rhoE+p)/rho), W(mean molar mass), Y_k ...
@@ -85,22 +94,30 @@ thermo_t readThermo(const std::string &caseDir, int nspec, int npa = 5);
 
 void buildKernel(occa::properties kernelInfo);
 
+// perfectGas: builds the thermo data from gamma and gasConstant.
+// nasa: reads aa/h0/s0/mw.dat from the case directory (readThermo).
+void setup();
+
+// nasa only: thermo data supplied by the caller.
 void setup(const thermo_t &thermo);
+
+bool perfectGas();
 
 // Host conserved state, size Neq()*nrs->fieldOffset, layout as above.
 void setSolution(const std::vector<dfloat> &U);
 
 // Build conserved variables from host primitives on meshV nodes:
 // velocity (3*fieldOffset), p, T (fieldOffset each), Y (nspec*fieldOffset).
+// Y may be left empty when nspec = 1 (Y = 1).
 std::vector<dfloat> conservedFromPrimitives(const std::vector<dfloat> &vel,
                                             const std::vector<dfloat> &p,
                                             const std::vector<dfloat> &T,
-                                            const std::vector<dfloat> &Y);
+                                            const std::vector<dfloat> &Y = {});
 
 // Advance o_U by one SSPRK3 step of size dt.
 void step(double time, dfloat dt);
 
-// Recompute primitives from o_U (Newton iteration for T).
+// Recompute primitives from o_U (closed form for perfectGas, Newton for T with nasa).
 void computePrimitives();
 
 // Largest |u| + a on this mesh, reduced over all ranks.
@@ -113,6 +130,7 @@ dfloat maxWaveSpeed();
 //   adios:     density, Y_<species> ...
 //   nek .fld:  scalar00 = density, scalar01.. = Y_k (ParaView: S01, S02, ...)
 // speciesNames overrides [DGCOMP] species; with neither, Y_00, Y_01, ...
+// With nspec = 1 no mass fraction is written (Y = 1).
 // The mapping is printed at setup.
 void addCheckpointFields(const std::vector<std::string> &speciesNames = {});
 

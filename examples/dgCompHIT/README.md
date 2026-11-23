@@ -18,10 +18,21 @@ It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 ## Parameters
 
 The par file has two user sections:
-- `[DGCOMP]` is read by the plugin: species, flux choices, feature switches, and CompNek5000 `userparam01..05` (`dtChem`, `avCstar`, `avCmax`, `avP`, `riemannSolver`).
-- `[CASEDATA]` is read by `dgCompHIT.udf`: `boxLength`, `T0`, `p0` and `Y0` (one mass fraction per species, summing to 1). These used to be hard-coded in `base.usr`.
+- `[DGCOMP]` is read by the plugin: thermo model, species, flux choices, feature switches, and CompNek5000 `userparam01..05` (`dtChem`, `avCstar`, `avCmax`, `avP`, `riemannSolver`).
+- `[CASEDATA]` is read by `dgCompHIT.udf` in `UDF_Setup0`, with plain `platform->par->extract` calls as in the other examples: `boxLength`, `T0`, `p0` and `Y0`. These used to be hard-coded in `base.usr`. `checkCaseData()` checks them in `UDF_Setup`, once the plugin knows nspec.
+
+### Thermo model
+
+| `thermo` | gas | needs | Y0 |
+|---|---|---|---|
+| `perfectGas` (plugin default) | one component, constant `gamma` and `gasConstant` | nothing extra | ignored |
+| `nasa` (this case) | mixture, NASA cp fits per species | `nspec`, `aa/h0/s0/mw.dat` | one mass fraction per species, summing to 1 |
+
+The par file uses `nasa` to match the CompNek5000 reference. Switching to `perfectGas` with gamma = 1.4 and R = 287 gives single-component air without any `.dat` files.
 
 ## Files to copy in from the CompNek5000 case
+
+The `.dat` files are only needed with `thermo = nasa`.
 
 | file | source |
 |---|---|
@@ -84,3 +95,5 @@ With `checkpointEngine = nek` (the nekRS default) the run writes `.fld` files in
 | `scalar02` | S03 | Y_N2 |
 
 If `species` is left out, the mass fractions are named `Y_00`, `Y_01`, ...
+
+With `thermo = perfectGas` there is one component, so no mass fraction is written; the scalars are density only.

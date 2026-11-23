@@ -19,6 +19,10 @@ rho = 1.0                  # unused with solver = none
 viscosity = 1.0            # unused with solver = none
 
 [DGCOMP]
+# The CompNek5000 reference uses the O2/N2 mixture. For single-component air
+# instead: thermo = perfectGas, gamma = 1.4, gasConstant = 287.0, and drop
+# nspec, species, npa and Y0 (no .dat files needed).
+thermo = nasa
 nspec = 2                  # O2, N2 (air1.yaml order)
 species = O2, N2           # output names Y_O2, Y_N2; same order as aa.dat/mw.dat
 npa = 5
@@ -41,4 +45,4 @@ avP = 0.7                  # userparam04
 boxLength = 1.6467320829664873e-4   # base.usr L0 [m]
 T0 = 300.0                 # [K]
 p0 = 1.0e5                 # [Pa]
-Y0 = 0.23, 0.77            # same order as species
+Y0 = 0.23, 0.77            # same order as species; nasa only
