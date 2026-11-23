@@ -1,0 +1,33 @@
+# Compressible HIT, Re_lambda = 100, Mt = 0.6, air (O2/N2), DGSEM plugin.
+# nekRS port of CompNek5000 compHIT_direct_Re_lamda_100 (see README.md).
+userSections = DGCOMP
+
+[GENERAL]
+polynomialOrder = 7        # CompNek5000 lx1 = 8
+dt = 1.5e-10               # same as base.par; nekRS rejects dt < 1e-10
+stopAt = endTime
+endTime = 5e-7             # ~4.51 tau0
+
+checkpointControl = simulationTime
+checkpointInterval = 5e-8
+checkpointEngine = adios   # named fields (density, Y_O2, Y_N2); nek -> .fld with S01, S02, ...
+
+[FLUID VELOCITY]
+solver = none              # dgComp owns the state; nekRS only writes checkpoints
+boundaryTypeMap = none     # fully periodic box
+rho = 1.0                  # unused with solver = none
+viscosity = 1.0            # unused with solver = none
+
+[DGCOMP]
+nspec = 2                  # O2, N2 (air1.yaml order)
+species = O2, N2           # output names Y_O2, Y_N2; same order as aa.dat/mw.dat
+npa = 5
+riemannSolver = llf        # userparam05 = 0; hllc once M1 has it
+volumeFlux = kep
+viscous = no               # set to yes in M2 (BR1 + Cantera transport)
+reacting = no
+splitChemistry = no
+clip = no
+positivityLimiter = no
+artificialViscosity = no
+fullInterfaceLLF = no

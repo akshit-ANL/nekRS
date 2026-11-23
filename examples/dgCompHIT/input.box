@@ -1,0 +1,18 @@
+dgCompHIT.rea
+-3                     spatial dimension  ( < 0 --> generate .rea/.re2 pair)
+1                      number of fields
+#=======================================================================
+#
+#    compHIT box: 32^3 elements on [0,1]^3, fully periodic.
+#    dgCompHIT.udf rescales the mesh to [0,L]^3 (CompNek5000 usrdat2).
+#
+#    Note that the character bcs _must_ have 3 spaces.
+#
+#=======================================================================
+#
+Box
+-32  -32  -32                                        nelx,nely,nelz for Box
+0 1 1.                                               x0,x1,gain  (rescaled in udf)
+0 1 1.                                               y0,y1,gain  (rescaled in udf)
+0 1 1.                                               z0,z1,gain  (rescaled in udf)
+P  ,P  ,P  ,P  ,P  ,P                                bc's  (3 chars each!)

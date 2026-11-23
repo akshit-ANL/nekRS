@@ -1,0 +1,288 @@
+// Compressible multi-species DGSEM kernels (port of CompNek5000).
+//
+// Defines set by dgComp::buildKernel:
+//   p_Nspec, p_Npa, p_Neq (= 4 + p_Nspec), p_Nprim, p_Ntrace (= p_Neq + p_Nprim), p_Ru
+//   p_PRHO, p_PU, p_PV, p_PW, p_PP, p_PT, p_PGAMMA, p_PASPD, p_PH, p_PWMEAN, p_PY0
+//
+// Conserved fields (stride offset): 0..2 rho*u, 3 rho*E, 4.. rho*Y_k.
+// Trace arrays (stride faceOffset): sk = e*p_NfacesNfp + f*p_Nfp + n,
+// the p_Neq conserved fields followed by the p_Nprim primitives.
+
+#define p_newtonTol 1e-8
+#define p_newtonMaxIt 1000
+#define p_newtonT0 500.0
+#define p_Tclip 298.0
+
+// Port of compvar.f::eval_dependent_vars (EOS part; transport, reaction rates
+// and entropy are not computed here).
+// The species sum is folded into mixture polynomials before the Newton loop,
+// which is algebraically the same as the Fortran per-iteration species loop.
+@kernel void dgPrimitives(const dlong N,
+                          const dlong offset,
+                          const int clip,
+                          @ restrict const dfloat *mw,
+                          @ restrict const dfloat *bi,
+                          @ restrict const dfloat *aa,
+                          @ restrict dfloat *U,
+                          @ restrict dfloat *P)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      dfloat rho = 0;
+      for (int k = 0; k < p_Nspec; k++) {
+        rho += U[n + (4 + k) * offset];
+      }
+      const dfloat invRho = 1 / rho;
+
+      dfloat Y[p_Nspec];
+      if (clip) {
+        dfloat ysum = 0;
+        for (int k = 0; k < p_Nspec; k++) {
+          Y[k] = fmax(U[n + (4 + k) * offset], 0.0) * invRho;
+          ysum += Y[k];
+        }
+        for (int k = 0; k < p_Nspec; k++) {
+          Y[k] /= ysum;
+          U[n + (4 + k) * offset] = rho * Y[k];
+        }
+      } else {
+        for (int k = 0; k < p_Nspec; k++) {
+          Y[k] = U[n + (4 + k) * offset] * invRho;
+        }
+      }
+
+      dfloat wminv = 0;
+      for (int k = 0; k < p_Nspec; k++) {
+        wminv += Y[k] / mw[k];
+      }
+      const dfloat Wmean = 1 / wminv;
+
+      const dfloat u = U[n + 0 * offset] * invRho;
+      const dfloat v = U[n + 1 * offset] * invRho;
+      const dfloat w = U[n + 2 * offset] * invRho;
+      const dfloat kinE = 0.5 * (u * u + v * v + w * w);
+      const dfloat intE = U[n + 3 * offset] * invRho - kinE;
+
+      // mixture coefficients: u(T) = sum_c b[c] T^c, cp(T) = sum_c a[c] T^c
+      dfloat b[p_Npa + 1];
+      dfloat a[p_Npa];
+      for (int c = 0; c <= p_Npa; c++) {
+        b[c] = 0;
+      }
+      for (int c = 0; c < p_Npa; c++) {
+        a[c] = 0;
+      }
+      for (int k = 0; k < p_Nspec; k++) {
+        for (int c = 0; c <= p_Npa; c++) {
+          b[c] += Y[k] * bi[k * (p_Npa + 1) + c];
+        }
+        for (int c = 0; c < p_Npa; c++) {
+          a[c] += Y[k] * aa[k * p_Npa + c];
+        }
+      }
+
+      // Newton for T, same start, tolerance and cap as the Fortran
+      dfloat T = p_newtonT0;
+      dfloat dT = 1;
+      int it = 0;
+      while (fabs(dT) > p_newtonTol && it <= p_newtonMaxIt) {
+        it++;
+        dfloat u0 = b[p_Npa];
+        dfloat dudT = p_Npa * b[p_Npa];
+        for (int c = p_Npa - 1; c >= 1; c--) {
+          u0 = u0 * T + b[c];
+          dudT = dudT * T + c * b[c];
+        }
+        u0 = u0 * T + b[0] - intE;
+        dT = -u0 / dudT;
+        T += dT;
+      }
+      if (clip && T < p_Tclip) {
+        T = p_Tclip;
+      }
+
+      const dfloat p = rho * T * p_Ru / Wmean;
+
+      dfloat cp = a[p_Npa - 1];
+      for (int c = p_Npa - 2; c >= 0; c--) {
+        cp = cp * T + a[c];
+      }
+      const dfloat gamma = cp / (cp - p_Ru / Wmean);
+
+      P[n + p_PRHO * offset] = rho;
+      P[n + p_PU * offset] = u;
+      P[n + p_PV * offset] = v;
+      P[n + p_PW * offset] = w;
+      P[n + p_PP * offset] = p;
+      P[n + p_PT * offset] = T;
+      P[n + p_PGAMMA * offset] = gamma;
+      P[n + p_PASPD * offset] = sqrt(p * gamma * invRho);
+      P[n + p_PH * offset] = (U[n + 3 * offset] + p) * invRho;
+      P[n + p_PWMEAN * offset] = Wmean;
+      for (int k = 0; k < p_Nspec; k++) {
+        P[n + (p_PY0 + k) * offset] = Y[k];
+      }
+    }
+  }
+}
+
+// Conserved variables from (velocity, p, T, Y), as in the CompNek5000 useric.
+@kernel void dgConserved(const dlong N,
+                         const dlong offset,
+                         @ restrict const dfloat *mw,
+                         @ restrict const dfloat *bi,
+                         @ restrict const dfloat *vel,
+                         @ restrict const dfloat *pr,
+                         @ restrict const dfloat *temp,
+                         @ restrict const dfloat *Y,
+                         @ restrict dfloat *U)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      const dfloat T = temp[n];
+
+      dfloat wminv = 0;
+      dfloat intE = 0;
+      for (int k = 0; k < p_Nspec; k++) {
+        const dfloat Yk = Y[n + k * offset];
+        wminv += Yk / mw[k];
+        dfloat uk = bi[k * (p_Npa + 1) + p_Npa];
+        for (int c = p_Npa - 1; c >= 0; c--) {
+          uk = uk * T + bi[k * (p_Npa + 1) + c];
+        }
+        intE += Yk * uk;
+      }
+      const dfloat rho = pr[n] / (p_Ru * T * wminv); // eval_EOS_D
+
+      const dfloat u = vel[n + 0 * offset];
+      const dfloat v = vel[n + 1 * offset];
+      const dfloat w = vel[n + 2 * offset];
+      const dfloat totE = intE + 0.5 * (u * u + v * v + w * w);
+
+      U[n + 0 * offset] = rho * u;
+      U[n + 1 * offset] = rho * v;
+      U[n + 2 * offset] = rho * w;
+      U[n + 3 * offset] = rho * totE;
+      for (int k = 0; k < p_Nspec; k++) {
+        U[n + (4 + k) * offset] = rho * Y[n + k * offset];
+      }
+    }
+  }
+}
+
+// Copy volume values to the element's own face nodes (the "M" side).
+@kernel void dgTraceGather(const dlong Nelements,
+                           const dlong offset,
+                           const dlong faceOffset,
+                           @ restrict const dlong *vmapM,
+                           @ restrict const dfloat *U,
+                           @ restrict const dfloat *P,
+                           @ restrict dfloat *faceM)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    for (int n = 0; n < p_NfacesNfp; ++n; @inner(0)) {
+      const dlong sk = e * p_NfacesNfp + n;
+      const dlong idM = vmapM[sk];
+      for (int f = 0; f < p_Neq; f++) {
+        faceM[sk + f * faceOffset] = U[idM + f * offset];
+      }
+      for (int f = 0; f < p_Nprim; f++) {
+        faceM[sk + (p_Neq + f) * faceOffset] = P[idM + f * offset];
+      }
+    }
+  }
+}
+
+// STUB (M1): flux-differencing volume term.
+// Port fluxLF.f / advect.f: for each node, sum_j 2 D_ij F#(U_i, U_j) along
+// r, s, t with the Pirozzoli KEP (volumeFlux = kep) or Gouasmi EC two-point
+// flux, contravariant metrics from vgeo, scaled by vgeo[p_IJWID] (= 1/(J w)).
+// Currently sets rhs = 0.
+@kernel void dgVolumeRhsHex3D(const dlong Nelements,
+                              const dlong offset,
+                              @ restrict const dfloat *vgeo,
+                              @ restrict const dfloat *D,
+                              @ restrict const dfloat *U,
+                              @ restrict const dfloat *P,
+                              @ restrict dfloat *rhs)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          for (int f = 0; f < p_Neq; f++) {
+            rhs[id + f * offset] = 0;
+          }
+        }
+      }
+    }
+  }
+}
+
+// STUB (M1): interface term.
+// On interior faces the neighbour value is faceP - faceM (faceP holds M + P
+// after the gs-add). EToB[e*p_Nfaces + face] > 0 marks a boundary face where
+// P must come from a boundary condition instead. Port the LLF (fluxLF.f) and
+// HLLC numerical fluxes; add (F* - F_M).n * sgeo[p_WSJID] * vgeo[p_IJWID] to
+// rhs[idM]. Corner and edge nodes belong to several faces, so loop over the
+// faces of an element in sequence to avoid write races.
+// Currently adds nothing.
+@kernel void dgSurfaceRhsHex3D(const dlong Nelements,
+                               const dlong offset,
+                               const dlong faceOffset,
+                               @ restrict const dlong *vmapM,
+                               @ restrict const dfloat *sgeo,
+                               @ restrict const dfloat *vgeo,
+                               @ restrict const int *EToB,
+                               @ restrict const dfloat *faceM,
+                               @ restrict const dfloat *faceP,
+                               @ restrict dfloat *rhs)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    for (int n = 0; n < p_Nfp; ++n; @inner(0)) {
+      for (int face = 0; face < p_Nfaces; face++) {
+        const dlong sk = e * p_NfacesNfp + face * p_Nfp + n;
+        const dlong idM = vmapM[sk];
+        const int bc = EToB[e * p_Nfaces + face];
+        if (bc > 0) {
+          // TODO(M3): boundary state
+        }
+        // TODO(M1): numerical flux, lift into rhs[idM + f * offset]
+      }
+    }
+  }
+}
+
+// SSPRK3 stage in Shu-Osher form: U <- alpha*U0 + beta*(U + dt*rhs)
+@kernel void dgSSPRKStage(const dlong N,
+                          const dlong offset,
+                          const dfloat alpha,
+                          const dfloat beta,
+                          const dfloat dt,
+                          @ restrict const dfloat *U0,
+                          @ restrict const dfloat *rhs,
+                          @ restrict dfloat *U)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      for (int f = 0; f < p_Neq; f++) {
+        const dlong id = n + f * offset;
+        U[id] = alpha * U0[id] + beta * (U[id] + dt * rhs[id]);
+      }
+    }
+  }
+}
+
+// |u| + a at every node, for the CFL estimate
+@kernel void dgWaveSpeed(const dlong N, const dlong offset, @ restrict const dfloat *P, @ restrict dfloat *lambda)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      const dfloat u = P[n + p_PU * offset];
+      const dfloat v = P[n + p_PV * offset];
+      const dfloat w = P[n + p_PW * offset];
+      lambda[n] = sqrt(u * u + v * v + w * w) + P[n + p_PASPD * offset];
+    }
+  }
+}

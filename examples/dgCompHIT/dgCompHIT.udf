@@ -1,0 +1,145 @@
+// Compressible HIT with the dgComp plugin (port of CompNek5000 compHIT).
+//
+// Initial condition, as in base.usr useric: air at T = 300 K, p = 1e5 Pa,
+// Y(O2, N2) = (0.23, 0.77), velocity from the Fourier modes in hit_modes.dat
+//   u(x) = sum_m a_m cos(2 pi n_m.x / L) + b_m sin(2 pi n_m.x / L)
+
+#include <fstream>
+
+#include "dgComp.hpp"
+
+static constexpr dfloat L = 1.6467320829664873e-4; // box length [m], base.usr L0
+static constexpr dfloat T0 = 300.0;
+static constexpr dfloat p0 = 1e5;
+static constexpr dfloat Y0[2] = {0.23, 0.77};
+
+#ifdef __okl__
+
+@kernel void fourierVelocity(const dlong N,
+                             const dlong offset,
+                             const int Nmodes,
+                             const dfloat invL,
+                             @ restrict const dfloat *x,
+                             @ restrict const dfloat *y,
+                             @ restrict const dfloat *z,
+                             @ restrict const dfloat *modes,
+                             @ restrict dfloat *U)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      const dfloat xs = 6.283185307179586 * x[n] * invL;
+      const dfloat ys = 6.283185307179586 * y[n] * invL;
+      const dfloat zs = 6.283185307179586 * z[n] * invL;
+      dfloat u = 0, v = 0, w = 0;
+      for (int m = 0; m < Nmodes; m++) {
+        const dfloat *md = modes + 9 * m; // nx ny nz ax ay az bx by bz
+        const dfloat phase = md[0] * xs + md[1] * ys + md[2] * zs;
+        const dfloat c = cos(phase);
+        const dfloat s = sin(phase);
+        u += md[3] * c + md[6] * s;
+        v += md[4] * c + md[7] * s;
+        w += md[5] * c + md[8] * s;
+      }
+      U[n + 0 * offset] = u;
+      U[n + 1 * offset] = v;
+      U[n + 2 * offset] = w;
+    }
+  }
+}
+
+#endif
+
+// hit_modes.dat: number_of_modes / L urms k0 seed cutoff / nx ny nz ax ay az bx by bz ...
+// Read on rank 0 and broadcast.
+static std::vector<dfloat> readModes(const std::string &fileName)
+{
+  int Nmodes = 0;
+  std::vector<double> buf;
+  if (platform->comm.mpiRank() == 0) {
+    std::ifstream f(fileName);
+    nekrsCheck(!f.is_open(), MPI_COMM_SELF, EXIT_FAILURE, "cannot open %s\n", fileName.c_str());
+    double Lfile, urms, k0, seed, cutoff;
+    f >> Nmodes >> Lfile >> urms >> k0 >> seed >> cutoff;
+    if (std::abs(Lfile - L) > 1e-12 * L) {
+      std::cout << "WARNING: hit_modes.dat length " << Lfile << " differs from L = " << L << std::endl;
+    }
+    buf.resize(9 * Nmodes);
+    for (auto &v : buf) {
+      f >> v;
+    }
+    nekrsCheck(!f, MPI_COMM_SELF, EXIT_FAILURE, "%s is truncated\n", fileName.c_str());
+    std::cout << "hit_modes.dat: " << Nmodes << " modes, urms = " << urms << std::endl;
+  }
+  MPI_Bcast(&Nmodes, 1, MPI_INT, 0, platform->comm.mpiComm());
+  buf.resize(9 * Nmodes);
+  MPI_Bcast(buf.data(), buf.size(), MPI_DOUBLE, 0, platform->comm.mpiComm());
+  return std::vector<dfloat>(buf.begin(), buf.end());
+}
+
+void UDF_Setup()
+{
+  auto mesh = nrs->meshV;
+
+  // genbox mesh on [0,1]^3 -> [0,L]^3 (usrdat2). Recompute vgeo/sgeo now,
+  // since dgComp uses them from the first step on.
+  platform->linAlg->rescale(0.0, L, mesh->o_x, platform->comm.mpiComm());
+  platform->linAlg->rescale(0.0, L, mesh->o_y, platform->comm.mpiComm());
+  platform->linAlg->rescale(0.0, L, mesh->o_z, platform->comm.mpiComm());
+  mesh->update();
+
+  const auto nspec = dgComp::Nspec();
+  nekrsCheck(nspec != 2, platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "dgCompHIT expects nspec = 2 (O2, N2)");
+
+  dgComp::setup(dgComp::readThermo(".", nspec));
+
+  if (platform->options.getArgs("RESTART FILE NAME").empty()) {
+    const auto offset = nrs->fieldOffset;
+
+    const auto modes = readModes("hit_modes.dat");
+    const int Nmodes = modes.size() / 9;
+    auto o_modes = platform->deviceMemoryPool.reserve<dfloat>(modes.size());
+    o_modes.copyFrom(modes.data(), modes.size());
+
+    auto o_vel = platform->deviceMemoryPool.reserve<dfloat>(3 * offset);
+    fourierVelocity(mesh->Nlocal, offset, Nmodes, 1 / L, mesh->o_x, mesh->o_y, mesh->o_z, o_modes, o_vel);
+    std::vector<dfloat> vel(3 * offset, 0.0);
+    o_vel.copyTo(vel.data(), vel.size());
+
+    std::vector<dfloat> p(offset, p0);
+    std::vector<dfloat> T(offset, T0);
+    std::vector<dfloat> Y(nspec * offset, 0.0);
+    for (int k = 0; k < nspec; k++) {
+      std::fill(Y.begin() + k * offset, Y.begin() + (k + 1) * offset, Y0[k]);
+    }
+
+    dgComp::setSolution(dgComp::conservedFromPrimitives(vel, p, T, Y));
+  } else {
+    // TODO(M1): restart from rho, u, p, T, Y in the checkpoint
+    nekrsAbort(platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "dgCompHIT: restart is not implemented yet");
+  }
+
+  dgComp::addCheckpointFields();
+
+  const auto lambda = dgComp::maxWaveSpeed();
+  if (platform->comm.mpiRank() == 0) {
+    std::cout << "dgCompHIT: max(|u| + a) = " << lambda << " m/s" << std::endl;
+  }
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  if (tstep == 0) {
+    return;
+  }
+
+  // time is the end of the step nekRS just took
+  const dfloat dt = nrs->dt[0];
+  dgComp::step(time - dt, dt);
+
+  if (tstep % 100 == 0) {
+    const auto lambda = dgComp::maxWaveSpeed();
+    if (platform->comm.mpiRank() == 0) {
+      std::cout << "dgCompHIT: step " << tstep << "  max(|u| + a) = " << lambda << " m/s" << std::endl;
+    }
+  }
+}

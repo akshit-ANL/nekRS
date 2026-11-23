@@ -1,0 +1,567 @@
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <iterator>
+#include <sstream>
+
+#include "nrs.hpp"
+#include "nekInterfaceAdapter.hpp"
+#include "udf.hpp"
+#include "linAlg.hpp"
+
+#include "dgComp.hpp"
+
+// Status (M0 scaffold): state allocation, primitives (EOS + Newton for T),
+// trace gather and face exchange, SSPRK3 and the wave-speed reduction work.
+// The volume and surface RHS kernels are stubs that return zero, so a run
+// should leave the solution unchanged. See doc/dg/ROADMAP.md, M1.
+
+namespace
+{
+
+constexpr dfloat Ru = 8.3144598; // J/(mol K), same value as CompNek5000
+
+nrs_t *_nrs = nullptr;
+mesh_t *mesh = nullptr;
+
+int nspec = 0;
+int npa = 5;
+int nEq = 0;
+int nPrim = 0;
+int nTrace = 0;
+
+dlong fieldOffset = 0;
+dlong faceOffset = 0;
+
+struct options_t {
+  int riemannSolver = 0; // 0 LLF, 1 HLLC
+  int volumeFlux = 0;    // 0 KEP (Pirozzoli), 1 EC (Gouasmi)
+  bool viscous = false;
+  bool reacting = false;
+  bool splitChemistry = false;
+  bool clip = false;
+  bool positivityLimiter = false;
+  bool artificialViscosity = false;
+  bool fullInterfaceLLF = false;
+} opt;
+
+occa::memory o_Ucons; // conserved state
+occa::memory o_U0;    // state at the start of the step
+occa::memory o_rhs;   // dU/dt
+occa::memory o_primv; // primitives
+occa::memory o_faceM; // own trace, nTrace fields of faceOffset
+occa::memory o_faceP; // M + P after the face exchange
+occa::memory o_lambda;
+
+occa::memory o_bi; // internal-energy polynomial, nspec*(npa+1)
+occa::memory o_aa; // cp polynomial, nspec*npa
+occa::memory o_mw;
+
+oogs_t *gshFace = nullptr;
+
+occa::kernel primitivesKernel;
+occa::kernel conservedKernel;
+occa::kernel traceGatherKernel;
+occa::kernel volumeRhsKernel;
+occa::kernel surfaceRhsKernel;
+occa::kernel ssprkStageKernel;
+occa::kernel waveSpeedKernel;
+
+bool buildKernelCalled = false;
+bool setupCalled = false;
+
+std::string toLower(std::string s)
+{
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+  return s;
+}
+
+bool parFlag(const std::string &key, bool defaultValue)
+{
+  std::string val;
+  if (!platform->par->extract("dgcomp", key, val)) {
+    return defaultValue;
+  }
+  val = toLower(val);
+  return val == "yes" || val == "true" || val == "on" || val == "1";
+}
+
+std::string parString(const std::string &key, const std::string &defaultValue)
+{
+  std::string val;
+  if (!platform->par->extract("dgcomp", key, val)) {
+    return defaultValue;
+  }
+  return toLower(val);
+}
+
+void readOptions()
+{
+  const auto riemann = parString("riemannsolver", "llf");
+  nekrsCheck(riemann != "llf" && riemann != "hllc",
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "[DGCOMP] riemannSolver = %s is not supported (llf | hllc)\n",
+             riemann.c_str());
+  opt.riemannSolver = (riemann == "hllc") ? 1 : 0;
+
+  const auto vflux = parString("volumeflux", "kep");
+  nekrsCheck(vflux != "kep" && vflux != "ec",
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "[DGCOMP] volumeFlux = %s is not supported (kep | ec)\n",
+             vflux.c_str());
+  opt.volumeFlux = (vflux == "ec") ? 1 : 0;
+
+  opt.viscous = parFlag("viscous", false);
+  opt.reacting = parFlag("reacting", false);
+  opt.splitChemistry = parFlag("splitchemistry", false);
+  opt.clip = parFlag("clip", false);
+  opt.positivityLimiter = parFlag("positivitylimiter", false);
+  opt.artificialViscosity = parFlag("artificialviscosity", false);
+  opt.fullInterfaceLLF = parFlag("fullinterfacellf", false);
+}
+
+// [DGCOMP] species = O2, N2 (comma or space separated). The par reader
+// lower-cases values, so the names are upper-cased back (O2, N2, H2O, OH).
+std::vector<std::string> speciesNamesFromPar()
+{
+  std::vector<std::string> names;
+  std::string val;
+  if (!platform->par->extract("dgcomp", "species", val)) {
+    return names;
+  }
+  std::replace(val.begin(), val.end(), ',', ' ');
+  std::istringstream ss(val);
+  for (std::string s; ss >> s;) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+    names.push_back(s);
+  }
+  return names;
+}
+
+std::vector<dfloat> readList(const std::string &fileName, size_t n)
+{
+  std::ifstream f(fileName);
+  nekrsCheck(!f.is_open(), platform->comm.mpiComm(), EXIT_FAILURE, "cannot open %s\n", fileName.c_str());
+
+  // Fortran list-directed files may use D exponents.
+  std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  std::replace(txt.begin(), txt.end(), 'D', 'E');
+  std::replace(txt.begin(), txt.end(), 'd', 'e');
+  std::replace(txt.begin(), txt.end(), ',', ' ');
+
+  std::istringstream is(txt);
+  std::vector<dfloat> v;
+  double x;
+  while (v.size() < n && is >> x) {
+    v.push_back(x);
+  }
+  nekrsCheck(v.size() != n,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s: expected %zu values, found %zu\n",
+             fileName.c_str(),
+             n,
+             v.size());
+  return v;
+}
+
+// Port of compvar.f::get_bi. Internal energy of species k:
+//   u_k(T) = sum_{c=0}^{npa} bi[k*(npa+1)+c] T^c
+std::vector<dfloat> computeBi(const dgComp::thermo_t &th)
+{
+  std::vector<dfloat> bi(nspec * (npa + 1));
+  for (int k = 0; k < nspec; k++) {
+    const dfloat *a = th.aa.data() + k * npa;
+    dfloat sum1 = 0;
+    for (int c = 0; c < npa; c++) {
+      sum1 += a[c] * std::pow(298.15, c + 1) / (c + 1);
+    }
+    dfloat *b = bi.data() + k * (npa + 1);
+    b[0] = th.h0[k] - sum1;
+    b[1] = a[0] - Ru / th.mw[k];
+    for (int c = 2; c <= npa; c++) {
+      b[c] = a[c - 1] / c;
+    }
+  }
+  return bi;
+}
+
+bool checkpointFieldsAdded = false;
+
+bool writeThroughFluid()
+{
+  return _nrs->fluid && platform->options.compareArgs(upperCase(_nrs->fluid->name) + " CHECKPOINTING", "TRUE");
+}
+
+void copyToFluid()
+{
+  if (!checkpointFieldsAdded || !writeThroughFluid()) {
+    return;
+  }
+  using namespace dgComp;
+  auto &fluid = _nrs->fluid;
+  for (int d = 0; d < 3; d++) {
+    fluid->o_U.copyFrom(o_primv, mesh->Nlocal, d * fluid->fieldOffset, (prim::U + d) * fieldOffset);
+  }
+  fluid->o_P.copyFrom(o_primv, mesh->Nlocal, 0, prim::P * fieldOffset);
+}
+
+void checkReady(const char *caller)
+{
+  nekrsCheck(!setupCalled || !buildKernelCalled,
+             MPI_COMM_SELF,
+             EXIT_FAILURE,
+             "dgComp::%s called prior to dgComp::setup()!\n",
+             caller);
+}
+
+// dU/dt = volume + surface terms. Stubs until M1.
+void computeRhs(double time)
+{
+  traceGatherKernel(mesh->Nelements, fieldOffset, faceOffset, mesh->o_vmapM, o_Ucons, o_primv, o_faceM);
+  o_faceP.copyFrom(o_faceM, nTrace * faceOffset);
+  oogs::startFinish(o_faceP, nTrace, faceOffset, ogsDfloat, ogsAdd, gshFace);
+
+  // TODO(M1): flux-differencing volume term (fluxLF.f / advect.f), KEP or EC
+  volumeRhsKernel(mesh->Nelements, fieldOffset, mesh->o_vgeo, mesh->o_D, o_Ucons, o_primv, o_rhs);
+
+  // TODO(M1): LLF / HLLC interface flux. P = o_faceP - o_faceM on interior
+  // faces; EToB > 0 marks boundary faces where P must come from a BC.
+  surfaceRhsKernel(mesh->Nelements,
+                   fieldOffset,
+                   faceOffset,
+                   mesh->o_vmapM,
+                   mesh->o_sgeo,
+                   mesh->o_vgeo,
+                   mesh->o_EToB,
+                   o_faceM,
+                   o_faceP,
+                   o_rhs);
+
+  // TODO(M2): BR1 viscous terms, transport from the Cantera host bridge
+  // TODO(M4): unsplit chemistry source when reacting && !splitChemistry
+}
+
+} // namespace
+
+dgComp::thermo_t dgComp::readThermo(const std::string &caseDir, int ns, int na)
+{
+  thermo_t th;
+  th.npa = na;
+  th.aa = readList(caseDir + "/aa.dat", ns * na);
+  th.h0 = readList(caseDir + "/h0.dat", ns);
+  th.s0 = readList(caseDir + "/s0.dat", ns);
+  th.mw = readList(caseDir + "/mw.dat", ns);
+  for (auto &w : th.mw) {
+    w *= 1e-3; // g/mol -> kg/mol, as CompNek5000 usrdat does
+  }
+  return th;
+}
+
+void dgComp::buildKernel(occa::properties kernelInfo)
+{
+  nekrsCheck(!platform->par->extract("dgcomp", "nspec", nspec) || nspec < 1,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "[DGCOMP] nspec is missing (add userSections = DGCOMP to the par file)");
+  platform->par->extract("dgcomp", "npa", npa);
+
+  nEq = 4 + nspec;
+  nPrim = prim::Y0 + nspec;
+  nTrace = nEq + nPrim;
+
+  kernelInfo["defines/p_Nspec"] = nspec;
+  kernelInfo["defines/p_Npa"] = npa;
+  kernelInfo["defines/p_Neq"] = nEq;
+  kernelInfo["defines/p_Nprim"] = nPrim;
+  kernelInfo["defines/p_Ntrace"] = nTrace;
+  kernelInfo["defines/p_Ru"] = Ru;
+
+  kernelInfo["defines/p_PRHO"] = prim::RHO;
+  kernelInfo["defines/p_PU"] = prim::U;
+  kernelInfo["defines/p_PV"] = prim::V;
+  kernelInfo["defines/p_PW"] = prim::W;
+  kernelInfo["defines/p_PP"] = prim::P;
+  kernelInfo["defines/p_PT"] = prim::T;
+  kernelInfo["defines/p_PGAMMA"] = prim::GAMMA;
+  kernelInfo["defines/p_PASPD"] = prim::ASPD;
+  kernelInfo["defines/p_PH"] = prim::H;
+  kernelInfo["defines/p_PWMEAN"] = prim::WMEAN;
+  kernelInfo["defines/p_PY0"] = prim::Y0;
+
+  auto buildKernel = [&kernelInfo](const std::string &kernelName) {
+    const auto path = getenv("NEKRS_KERNEL_DIR") + std::string("/app/nrs/plugins/");
+    const auto fileName = path + "dgComp.okl";
+    const auto reqName = "dgComp::";
+    if (platform->options.compareArgs("REGISTER ONLY", "TRUE")) {
+      platform->kernelRequests.add(reqName, fileName, kernelInfo);
+      return occa::kernel();
+    } else {
+      buildKernelCalled = true;
+      return platform->kernelRequests.load(reqName, kernelName);
+    }
+  };
+
+  primitivesKernel = buildKernel("dgPrimitives");
+  conservedKernel = buildKernel("dgConserved");
+  traceGatherKernel = buildKernel("dgTraceGather");
+  volumeRhsKernel = buildKernel("dgVolumeRhsHex3D");
+  surfaceRhsKernel = buildKernel("dgSurfaceRhsHex3D");
+  ssprkStageKernel = buildKernel("dgSSPRKStage");
+  waveSpeedKernel = buildKernel("dgWaveSpeed");
+}
+
+void dgComp::setup(const thermo_t &th)
+{
+  if (setupCalled) {
+    return;
+  }
+
+  nekrsCheck(!buildKernelCalled,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp::buildKernel was not called (include dgComp.hpp in the .udf)");
+
+  _nrs = dynamic_cast<nrs_t *>(platform->app);
+  mesh = _nrs->meshV;
+  fieldOffset = _nrs->fieldOffset;
+
+  nekrsCheck(th.npa != npa || th.aa.size() != static_cast<size_t>(nspec * npa) ||
+                 th.h0.size() != static_cast<size_t>(nspec) || th.mw.size() != static_cast<size_t>(nspec),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp::setup: thermo data does not match [DGCOMP] nspec/npa");
+
+  readOptions();
+
+  nekrsCheck(opt.riemannSolver != 0 || opt.reacting || opt.positivityLimiter || opt.artificialViscosity,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp: only LLF without chemistry, limiter or AV is implemented so far; see doc/dg/ROADMAP.md");
+  if (opt.viscous && platform->comm.mpiRank() == 0) {
+    printf("dgComp: WARNING viscous = yes but viscous terms are not implemented yet (M2), running inviscid\n");
+  }
+
+  // trace layout: e*Nfaces*Nfp + f*Nfp + n, nTrace fields
+  const dlong Ntr = mesh->Nelements * mesh->Nfaces * mesh->Nfp;
+  faceOffset = alignStride<dfloat>(Ntr);
+
+  o_Ucons = platform->device.malloc<dfloat>(nEq * fieldOffset);
+  o_U0 = platform->device.malloc<dfloat>(nEq * fieldOffset);
+  o_rhs = platform->device.malloc<dfloat>(nEq * fieldOffset);
+  o_primv = platform->device.malloc<dfloat>(nPrim * fieldOffset);
+  o_faceM = platform->device.malloc<dfloat>(nTrace * faceOffset);
+  o_faceP = platform->device.malloc<dfloat>(nTrace * faceOffset);
+  o_lambda = platform->device.malloc<dfloat>(fieldOffset);
+
+  platform->linAlg->fill(nEq * fieldOffset, 0.0, o_Ucons);
+  platform->linAlg->fill(nEq * fieldOffset, 0.0, o_rhs);
+  platform->linAlg->fill(nPrim * fieldOffset, 0.0, o_primv); // T = 0 -> Newton starts at 500 K
+  platform->linAlg->fill(nTrace * faceOffset, 0.0, o_faceM);
+
+  const auto bi = computeBi(th);
+  o_bi = platform->device.malloc<dfloat>(bi.size());
+  o_bi.copyFrom(bi.data());
+  o_aa = platform->device.malloc<dfloat>(th.aa.size());
+  o_aa.copyFrom(th.aa.data());
+  o_mw = platform->device.malloc<dfloat>(th.mw.size());
+  o_mw.copyFrom(th.mw.data());
+
+  // Face exchange: globalFaceIds pairs each face node with its neighbour's
+  // (periodicity included), so a gs-add gives M + P.
+  gshFace = oogs::setup(Ntr,
+                        mesh->globalFaceIds,
+                        nTrace,
+                        faceOffset,
+                        ogsDfloat,
+                        platform->comm.mpiComm(),
+                        1,
+                        platform->device.occaDevice(),
+                        NULL,
+                        OOGS_AUTO);
+
+  if (platform->comm.mpiRank() == 0) {
+    printf("dgComp: nspec=%d npa=%d nEq=%d riemann=%s volumeFlux=%s clip=%d\n",
+           nspec,
+           npa,
+           nEq,
+           opt.riemannSolver ? "hllc" : "llf",
+           opt.volumeFlux ? "ec" : "kep",
+           opt.clip);
+  }
+
+  setupCalled = true;
+}
+
+void dgComp::setSolution(const std::vector<dfloat> &U)
+{
+  checkReady("setSolution");
+  nekrsCheck(U.size() != static_cast<size_t>(nEq * fieldOffset),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp::setSolution: size must be nEq*fieldOffset");
+  o_Ucons.copyFrom(U.data(), U.size());
+  computePrimitives();
+  copyToFluid();
+}
+
+std::vector<dfloat> dgComp::conservedFromPrimitives(const std::vector<dfloat> &vel,
+                                                    const std::vector<dfloat> &p,
+                                                    const std::vector<dfloat> &T,
+                                                    const std::vector<dfloat> &Y)
+{
+  checkReady("conservedFromPrimitives");
+
+  auto o_vel = platform->deviceMemoryPool.reserve<dfloat>(3 * fieldOffset);
+  auto o_p = platform->deviceMemoryPool.reserve<dfloat>(fieldOffset);
+  auto o_T = platform->deviceMemoryPool.reserve<dfloat>(fieldOffset);
+  auto o_Y = platform->deviceMemoryPool.reserve<dfloat>(nspec * fieldOffset);
+  o_vel.copyFrom(vel.data(), 3 * fieldOffset);
+  o_p.copyFrom(p.data(), fieldOffset);
+  o_T.copyFrom(T.data(), fieldOffset);
+  o_Y.copyFrom(Y.data(), nspec * fieldOffset);
+
+  auto o_Utmp = platform->deviceMemoryPool.reserve<dfloat>(nEq * fieldOffset);
+  conservedKernel(mesh->Nlocal, fieldOffset, o_mw, o_bi, o_vel, o_p, o_T, o_Y, o_Utmp);
+
+  std::vector<dfloat> U(nEq * fieldOffset, 0.0);
+  o_Utmp.copyTo(U.data(), U.size());
+  return U;
+}
+
+void dgComp::computePrimitives()
+{
+  checkReady("computePrimitives");
+  primitivesKernel(mesh->Nlocal, fieldOffset, static_cast<int>(opt.clip), o_mw, o_bi, o_aa, o_Ucons, o_primv);
+}
+
+void dgComp::step(double time, dfloat dt)
+{
+  checkReady("step");
+
+  // SSPRK3 in Shu-Osher form, U <- alpha*U0 + beta*(U + dt*rhs).
+  // Same coefficients as CompNek5000 rungeKutta.f; note the Fortran rkRHS is
+  // -dU/dt, here o_rhs is +dU/dt.
+  constexpr dfloat alpha[3] = {0.0, 0.75, 1.0 / 3.0};
+  constexpr dfloat beta[3] = {1.0, 0.25, 2.0 / 3.0};
+  constexpr dfloat cstage[3] = {0.0, 1.0, 0.5};
+
+  o_U0.copyFrom(o_Ucons, nEq * fieldOffset);
+
+  for (int s = 0; s < 3; s++) {
+    computeRhs(time + cstage[s] * dt);
+    ssprkStageKernel(mesh->Nlocal, fieldOffset, alpha[s], beta[s], dt, o_U0, o_rhs, o_Ucons);
+    // TODO(M3): Zhang-Shu positivity limiter when opt.positivityLimiter
+    computePrimitives();
+  }
+
+  // TODO(M4): Strang-split chemistry when reacting && splitChemistry
+
+  copyToFluid();
+}
+
+dfloat dgComp::maxWaveSpeed()
+{
+  checkReady("maxWaveSpeed");
+  waveSpeedKernel(mesh->Nlocal, fieldOffset, o_primv, o_lambda);
+  return platform->linAlg->max(mesh->Nlocal, o_lambda, platform->comm.mpiComm());
+}
+
+void dgComp::addCheckpointFields(const std::vector<std::string> &speciesNames)
+{
+  checkReady("addCheckpointFields");
+  if (checkpointFieldsAdded) {
+    return;
+  }
+
+  auto names = speciesNames.empty() ? speciesNamesFromPar() : speciesNames;
+  if (names.empty()) {
+    for (int k = 0; k < nspec; k++) {
+      names.push_back(scalarDigitStr(k));
+    }
+  }
+  nekrsCheck(names.size() != static_cast<size_t>(nspec),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "dgComp: %zu species names given, nspec = %d\n",
+             names.size(),
+             nspec);
+
+  // The nek (.fld) writer only accepts velocity/pressure/temperature and
+  // scalarNN, so named fields need checkpointEngine = adios.
+  const bool namedFields = platform->options.compareArgs("CHECKPOINT ENGINE", "ADIOS");
+  nekrsCheck(!namedFields && nspec + 1 > NSCALAR_MAX,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "dgComp: density + %d mass fractions exceed the %d scalars of the .fld format, use "
+             "checkpointEngine = adios\n",
+             nspec,
+             NSCALAR_MAX);
+
+  auto slice = [](int f) {
+    return deviceMemory<dfloat>(o_primv.slice(f * fieldOffset, mesh->Nlocal));
+  };
+
+  // With [FLUID VELOCITY] solver = none nekRS still writes fluid->o_U/o_P, so
+  // copy into them (copyToFluid) instead of adding a second "velocity" field.
+  checkpointFieldsAdded = true;
+  if (writeThroughFluid()) {
+    copyToFluid();
+  } else {
+    _nrs->addUserCheckpointField("velocity", {slice(prim::U), slice(prim::V), slice(prim::W)});
+    _nrs->addUserCheckpointField("pressure", {slice(prim::P)});
+  }
+  _nrs->addUserCheckpointField("temperature", {slice(prim::T)});
+
+  // scalar fields: density, then one mass fraction per species
+  std::vector<std::pair<std::string, int>> scalars = {{"density", prim::RHO}};
+  for (int k = 0; k < nspec; k++) {
+    scalars.push_back({"Y_" + names[k], prim::Y0 + k});
+  }
+
+  std::ostringstream map;
+  for (int i = 0; i < static_cast<int>(scalars.size()); i++) {
+    const auto &[label, field] = scalars[i];
+    const auto fieldName = namedFields ? label : "scalar" + scalarDigitStr(i);
+    _nrs->addUserCheckpointField(fieldName, {slice(field)});
+    // ParaView's Nek5000 reader shows scalarNN as S<NN+1>
+    map << "\n  " << (namedFields ? label : "S" + scalarDigitStr(i + 1) + " = " + label);
+  }
+
+  if (platform->comm.mpiRank() == 0) {
+    std::cout << "dgComp: checkpoint fields (" << (namedFields ? "adios" : "nek .fld")
+              << "): velocity, pressure, temperature" << map.str() << std::endl;
+  }
+}
+
+int dgComp::Nspec()
+{
+  return nspec;
+}
+
+int dgComp::Neq()
+{
+  return nEq;
+}
+
+int dgComp::Nprim()
+{
+  return nPrim;
+}
+
+occa::memory dgComp::o_U()
+{
+  return o_Ucons;
+}
+
+occa::memory dgComp::o_prim()
+{
+  return o_primv;
+}

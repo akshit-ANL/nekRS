@@ -140,6 +140,7 @@ int udfMake(setupAide &options, const std::string &solverName, int rank)
     std::map<std::string, std::string> pluginTable = {{"nekrs_tavg_hpp_", "tavg::registerKernels"},
                                                       {"nekrs_RANSktau_hpp_", "RANSktau::buildKernel"},
                                                       {"nekrs_lowMach_hpp_", "lowMach::buildKernel"},
+                                                      {"nekrs_dgComp_hpp_", "dgComp::buildKernel"},
                                                       {"nekrs_recycling_hpp_", "planarCopy::buildKernel"},
                                                       {"nekrs_lpm_hpp_", "lpm_t::registerKernels"}};
 
