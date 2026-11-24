@@ -254,7 +254,9 @@ void parseGeneralSection(const int rank, setupAide &options, inipp::Ini *ini)
   if (!ini->extract("general", "writeinterval", writeInterval)) {
     ini->extract("general", "checkpointinterval", writeInterval);
   }
-  options.setArgs("CHECKPOINT INTERVAL", std::to_string(writeInterval));
+  // to_string_f, not std::to_string: "%f" turns a simulationTime interval
+  // below 1e-6 (e.g. 5e-8) into "0.000000", which disables checkpointing
+  options.setArgs("CHECKPOINT INTERVAL", to_string_f(writeInterval));
 
   std::string writeControl;
   if (!ini->extract("general", "writecontrol", writeControl)) {
