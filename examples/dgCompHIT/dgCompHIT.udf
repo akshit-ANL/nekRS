@@ -8,7 +8,9 @@
 // needed) or nasa (the CompNek5000 reference, air as O2/N2 = 0.23/0.77).
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <iomanip>
 
 #include "dgComp.hpp"
 
@@ -17,6 +19,9 @@ static dfloat L = 0;           // boxLength, base.usr L0 [m]
 static dfloat T0 = 0;          // T0 [K]
 static dfloat p0 = 0;          // p0 [Pa]
 static std::vector<dfloat> Y0; // Y0, one mass fraction per species (nasa only)
+static dfloat mu0 = 0;         // mu0 [Pa s], only for Re_lambda in stat.dat (no transport before M2)
+static int statInterval = 1;   // steps between stat.dat/stat_ref.dat rows (base.usr sfreq)
+static int consInterval = 10;  // steps between cons.dat rows (base.usr cfreq)
 
 #ifdef __okl__
 
@@ -52,6 +57,131 @@ static std::vector<dfloat> Y0; // Y0, one mass fraction per species (nasa only)
   }
 }
 
+// Pointwise integrands for the HIT statistics. The velocity gradient is
+// element-local (like gradm1 in base.usr, no averaging across faces).
+//   work 0 |u|^2   1 (du/dx)^2   2 |curl u|^2   3 div u   4 (div u)^2
+@kernel void hitStatPointwise(const dlong Nelements,
+                              const dlong offset,
+                              @ restrict const dfloat *vgeo,
+                              @ restrict const dfloat *D,
+                              @ restrict const dfloat *U,
+                              @ restrict dfloat *work)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_u[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_v[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_w[p_Nq][p_Nq][p_Nq];
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        s_D[j][i] = D[j * p_Nq + i];
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nq * p_Nq + j * p_Nq + i;
+          s_u[k][j][i] = U[id + 0 * offset];
+          s_v[k][j][i] = U[id + 1 * offset];
+          s_w[k][j][i] = U[id + 2 * offset];
+        }
+      }
+    }
+
+    @barrier();
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        for (int k = 0; k < p_Nq; ++k) {
+          dfloat ur = 0, us = 0, ut = 0;
+          dfloat vr = 0, vs = 0, vt = 0;
+          dfloat wr = 0, ws = 0, wt = 0;
+          for (int n = 0; n < p_Nq; ++n) {
+            const dfloat Dr = s_D[i][n];
+            const dfloat Ds = s_D[j][n];
+            const dfloat Dt = s_D[k][n];
+            ur += Dr * s_u[k][j][n];
+            us += Ds * s_u[k][n][i];
+            ut += Dt * s_u[n][j][i];
+            vr += Dr * s_v[k][j][n];
+            vs += Ds * s_v[k][n][i];
+            vt += Dt * s_v[n][j][i];
+            wr += Dr * s_w[k][j][n];
+            ws += Ds * s_w[k][n][i];
+            wt += Dt * s_w[n][j][i];
+          }
+
+          const dlong gid = e * p_Np * p_Nvgeo + k * p_Nq * p_Nq + j * p_Nq + i;
+          const dfloat rx = vgeo[gid + p_RXID * p_Np];
+          const dfloat ry = vgeo[gid + p_RYID * p_Np];
+          const dfloat rz = vgeo[gid + p_RZID * p_Np];
+          const dfloat sx = vgeo[gid + p_SXID * p_Np];
+          const dfloat sy = vgeo[gid + p_SYID * p_Np];
+          const dfloat sz = vgeo[gid + p_SZID * p_Np];
+          const dfloat tx = vgeo[gid + p_TXID * p_Np];
+          const dfloat ty = vgeo[gid + p_TYID * p_Np];
+          const dfloat tz = vgeo[gid + p_TZID * p_Np];
+
+          const dfloat dudx = rx * ur + sx * us + tx * ut;
+          const dfloat dudy = ry * ur + sy * us + ty * ut;
+          const dfloat dudz = rz * ur + sz * us + tz * ut;
+          const dfloat dvdx = rx * vr + sx * vs + tx * vt;
+          const dfloat dvdy = ry * vr + sy * vs + ty * vt;
+          const dfloat dvdz = rz * vr + sz * vs + tz * vt;
+          const dfloat dwdx = rx * wr + sx * ws + tx * wt;
+          const dfloat dwdy = ry * wr + sy * ws + ty * wt;
+          const dfloat dwdz = rz * wr + sz * ws + tz * wt;
+
+          const dfloat ox = dwdy - dvdz;
+          const dfloat oy = dudz - dwdx;
+          const dfloat oz = dvdx - dudy;
+          const dfloat div = dudx + dvdy + dwdz;
+
+          const dfloat u = s_u[k][j][i];
+          const dfloat v = s_v[k][j][i];
+          const dfloat w = s_w[k][j][i];
+
+          const dlong id = e * p_Np + k * p_Nq * p_Nq + j * p_Nq + i;
+          work[id + 0 * offset] = u * u + v * v + w * w;
+          work[id + 1 * offset] = dudx * dudx;
+          work[id + 2 * offset] = ox * ox + oy * oy + oz * oz;
+          work[id + 3 * offset] = div;
+          work[id + 4 * offset] = div * div;
+        }
+      }
+    }
+  }
+}
+
+// Second pass, squared deviations from the volume means (two-pass, so the
+// near-zero initial T variance is not lost to cancellation).
+//   work 5 |u - <u>|^2   6 (p - <p>)^2   7 (T - <T>)^2   8 (div u - <div u>)^2
+@kernel void hitStatDeviation(const dlong N,
+                              const dlong offset,
+                              const dfloat um,
+                              const dfloat vm,
+                              const dfloat wm,
+                              const dfloat pm,
+                              const dfloat Tm,
+                              const dfloat thm,
+                              @ restrict const dfloat *U,
+                              @ restrict const dfloat *p,
+                              @ restrict const dfloat *T,
+                              @ restrict dfloat *work)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      const dfloat du = U[n + 0 * offset] - um;
+      const dfloat dv = U[n + 1 * offset] - vm;
+      const dfloat dw = U[n + 2 * offset] - wm;
+      const dfloat dp = p[n] - pm;
+      const dfloat dT = T[n] - Tm;
+      const dfloat dth = work[n + 3 * offset] - thm;
+      work[n + 5 * offset] = du * du + dv * dv + dw * dw;
+      work[n + 6 * offset] = dp * dp;
+      work[n + 7 * offset] = dT * dT;
+      work[n + 8 * offset] = dth * dth;
+    }
+  }
+}
+
 #endif
 
 // Sanity checks on [CASEDATA]. Called from UDF_Setup, once dgComp knows nspec.
@@ -67,6 +197,12 @@ static void checkCaseData(int nspec)
   positive("boxLength", L);
   positive("T0", T0);
   positive("p0", p0);
+  positive("statInterval", statInterval);
+  positive("consInterval", consInterval);
+  nekrsCheck(mu0 < 0, platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "[CASEDATA] mu0 is negative");
+  if (mu0 == 0 && platform->comm.mpiRank() == 0) {
+    std::cout << "WARNING: [CASEDATA] mu0 not set, stat.dat writes Re_lambda = 0" << std::endl;
+  }
 
   if (nspec == 1) {
     return; // Y = 1, Y0 is ignored
@@ -132,6 +268,209 @@ static std::vector<dfloat> readModes(const std::string &fileName)
   return std::vector<dfloat>(buf.begin(), buf.end());
 }
 
+// ---------------------------------------------------------------------------
+// HIT statistics, ports of base.usr calc_stat (stat.dat), hit_ref_stat
+// (stat_ref.dat) and check_cons (cons.dat). Same columns and number formats,
+// so the CompNek5000 plotting scripts read these files unchanged.
+//
+// <f> is the volume average sum(Jw f) / volume, the same as
+// glsc2(f,bm1,n)/volvm1. Velocity gradients are element-local (gradm1).
+// ---------------------------------------------------------------------------
+
+// Fortran Ew.d, e.g. E13.5 -> "  0.12345E+01"
+static std::string fortranE(double v, int w, int d)
+{
+  std::string s;
+  if (!std::isfinite(v)) {
+    s = std::isnan(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity");
+  } else {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*E", d - 1, std::abs(v)); // d.dddE+xx
+    const std::string m(buf);
+    const auto ePos = m.find('E');
+    const int ex = (v == 0) ? 0 : std::stoi(m.substr(ePos + 1)) + 1;
+    const std::string digits = m.substr(0, 1) + m.substr(2, ePos - 2);
+    snprintf(buf, sizeof(buf), "%s0.%sE%c%02d", v < 0 ? "-" : "", digits.c_str(), ex < 0 ? '-' : '+', std::abs(ex));
+    s = buf;
+  }
+  return std::string(std::max(0, w - static_cast<int>(s.size())), ' ') + s;
+}
+
+// Fortran ES24.16E3, e.g. "  1.2345678901234567E+000"
+static std::string fortranES(double v)
+{
+  std::string s;
+  if (!std::isfinite(v)) {
+    s = std::isnan(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity");
+  } else {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.16E", v);
+    const std::string m(buf);
+    const auto ePos = m.find('E');
+    const int ex = std::stoi(m.substr(ePos + 1));
+    snprintf(buf, sizeof(buf), "%sE%c%03d", m.substr(0, ePos).c_str(), ex < 0 ? '-' : '+', std::abs(ex));
+    s = buf;
+  }
+  return std::string(std::max(0, 24 - static_cast<int>(s.size())), ' ') + s;
+}
+
+// integral of f over the domain, glsc2(f,bm1,n)
+static dfloat integral(const occa::memory &o_f)
+{
+  auto mesh = nrs->meshV;
+  return platform->linAlg->innerProd(mesh->Nlocal, mesh->o_LMM, o_f, platform->comm.mpiComm());
+}
+
+static dfloat volumeAverage(const occa::memory &o_f)
+{
+  return integral(o_f) / nrs->meshV->volume;
+}
+
+// Reference scales, set from the initial state (tstep 0)
+static dfloat tau0 = 0;   // lambda/urms
+static dfloat K0 = 0;     // 1.5 urms^2
+static dfloat c0 = 0;     // <a>
+static dfloat gamma0 = 0; // <gamma>
+static dfloat Mt0 = 0;    // sqrt(3) urms / c0
+static dfloat Tscale = 0; // (gamma0 - 1) <T> Mt0^2
+static dfloat mass0 = 0;  // integral of rho
+static dfloat energy0 = 0; // integral of rho E
+
+static void checkConservation(double time, int tstep)
+{
+  const auto offset = nrs->fieldOffset;
+  const auto Nlocal = nrs->meshV->Nlocal;
+  const dfloat mass = integral(dgComp::o_prim().slice(dgComp::prim::RHO * offset, Nlocal));
+  const dfloat energy = integral(dgComp::o_U().slice(3 * offset, Nlocal));
+
+  if (tstep == 0) {
+    mass0 = mass;
+    energy0 = energy;
+  }
+
+  if (platform->comm.mpiRank() != 0) {
+    return;
+  }
+
+  if (tstep == 0) {
+    std::cout << std::setprecision(15) << "dgCompHIT: m0 = " << mass0 << "  e0 = " << energy0
+              << std::setprecision(6) << std::endl;
+    std::ofstream empty("cons.dat", std::ios::trunc);
+    return;
+  }
+
+  std::ofstream f("cons.dat", std::ios::app);
+  f << fortranE(time, 13, 5) << fortranE((mass0 - mass) / mass0, 15, 7)
+    << fortranE((energy0 - energy) / energy0, 15, 7) << "\n";
+}
+
+static void hitStatistics(double time, int tstep)
+{
+  namespace prim = dgComp::prim;
+  auto mesh = nrs->meshV;
+  const auto offset = nrs->fieldOffset;
+  const auto Nlocal = mesh->Nlocal;
+
+  auto o_prim = dgComp::o_prim();
+  auto primField = [&](int f) { return o_prim.slice(f * offset, Nlocal); };
+
+  auto o_work = platform->deviceMemoryPool.reserve<dfloat>(9 * offset);
+  auto workField = [&](int f) { return o_work.slice(f * offset, Nlocal); };
+
+  // pass 1: means
+  hitStatPointwise(mesh->Nelements, offset, mesh->o_vgeo, mesh->o_D, o_prim.slice(prim::U * offset), o_work);
+
+  const dfloat um = volumeAverage(primField(prim::U));
+  const dfloat vm = volumeAverage(primField(prim::V));
+  const dfloat wm = volumeAverage(primField(prim::W));
+  const dfloat pm = volumeAverage(primField(prim::P));
+  const dfloat Tm = volumeAverage(primField(prim::T));
+  const dfloat rhom = volumeAverage(primField(prim::RHO));
+  const dfloat tke = volumeAverage(workField(0));     // <|u|^2>
+  const dfloat dudx2 = volumeAverage(workField(1));   // <(du/dx)^2>
+  const dfloat omega2 = volumeAverage(workField(2));  // <|curl u|^2>
+  const dfloat thetavg = volumeAverage(workField(3)); // <div u>
+  const dfloat theta2 = volumeAverage(workField(4));  // <(div u)^2>
+
+  // pass 2: variances about the means
+  hitStatDeviation(Nlocal,
+                   offset,
+                   um,
+                   vm,
+                   wm,
+                   pm,
+                   Tm,
+                   thetavg,
+                   o_prim.slice(prim::U * offset),
+                   o_prim.slice(prim::P * offset),
+                   o_prim.slice(prim::T * offset),
+                   o_work);
+
+  const dfloat urms = std::sqrt(volumeAverage(workField(5)) / 3);
+  const dfloat prms = std::sqrt(volumeAverage(workField(6)));
+  const dfloat Trms = std::sqrt(volumeAverage(workField(7)));
+  const dfloat thetvar = volumeAverage(workField(8));
+
+  const dfloat lambda = std::sqrt(urms * urms / dudx2);
+  const dfloat ReLambda = (mu0 > 0) ? urms * lambda * rhom / mu0 : 0;
+  const dfloat kinetic = 1.5 * urms * urms;
+  const dfloat Tvar = Trms * Trms;
+
+  if (tstep == 0) {
+    tau0 = lambda / urms;
+    K0 = kinetic;
+    c0 = volumeAverage(primField(prim::ASPD));
+    gamma0 = volumeAverage(primField(prim::GAMMA));
+    Mt0 = std::sqrt(3.0) * urms / c0;
+    Tscale = (gamma0 - 1) * Tm * Mt0 * Mt0;
+  }
+
+  if (platform->comm.mpiRank() != 0) {
+    return;
+  }
+
+  if (tstep == 0) {
+    std::cout << std::setprecision(10) << "dgCompHIT: initial statistics\n"
+              << "  tau0         = " << tau0 << "\n"
+              << "  urms0        = " << urms << "\n"
+              << "  lambda0      = " << lambda << "\n"
+              << "  Re_lambda0   = " << ReLambda << (mu0 > 0 ? "" : "  ([CASEDATA] mu0 not set)") << "\n"
+              << "  rho0         = " << rhom << "  mu0 = " << mu0 << "\n"
+              << "  sound_speed0 = " << c0 << "\n"
+              << "  Mt0          = " << Mt0 << std::setprecision(6) << std::endl;
+
+    std::ofstream empty("stat.dat", std::ios::trunc); // rows start at tstep 1, as in base.usr
+
+    std::ofstream f("stat_ref.dat", std::ios::trunc);
+    f << "# Bielawski Fig. A.15 statistics\n"
+      << "# scales: K0 tau0 Tscale Mt0 gamma0 c0 " << fortranES(K0) << fortranES(tau0) << fortranES(Tscale)
+      << fortranES(Mt0) << fortranES(gamma0) << fortranES(c0) << "\n"
+      << "# columns: time t_over_tau0 K_over_K0 omega2_tau0sq Tvar_over_Tscalesq theta2_tau0sq"
+      << " K omega2 Tvar theta2 theta_mean theta_var\n";
+  } else {
+    std::ofstream f("stat.dat", std::ios::app);
+    f << fortranE(time / tau0, 13, 5) << fortranE(tke, 15, 7) << fortranE(urms, 15, 7) << fortranE(lambda, 15, 7)
+      << fortranE(ReLambda, 15, 7) << fortranE(prms, 15, 7) << fortranE(Trms, 15, 7) << "\n";
+  }
+
+  std::ofstream f("stat_ref.dat", std::ios::app);
+  f << fortranES(time) << fortranES(time / tau0) << fortranES(kinetic / K0) << fortranES(omega2 * tau0 * tau0)
+    << fortranES(Tvar / (Tscale * Tscale)) << fortranES(theta2 * tau0 * tau0) << fortranES(kinetic)
+    << fortranES(omega2) << fortranES(Tvar) << fortranES(theta2) << fortranES(thetavg) << fortranES(thetvar)
+    << "\n";
+}
+
+// Every rank must call this (the reductions are collective).
+static void reportStatistics(double time, int tstep)
+{
+  if (tstep % statInterval == 0) {
+    hitStatistics(time, tstep);
+  }
+  if (tstep % consInterval == 0) {
+    checkConservation(time, tstep);
+  }
+}
+
 // Call order (src/lib/nekrs.cpp):
 //   UDF_Setup0 -> kernel build (UDF_LoadKernels, then dgComp::buildKernel,
 //   which reads [DGCOMP] thermo/nspec/npa) -> mesh and solver setup -> UDF_Setup
@@ -140,6 +479,9 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options)
   platform->par->extract("casedata", "boxlength", L);
   platform->par->extract("casedata", "t0", T0);
   platform->par->extract("casedata", "p0", p0);
+  platform->par->extract("casedata", "mu0", mu0);
+  platform->par->extract("casedata", "statinterval", statInterval);
+  platform->par->extract("casedata", "consinterval", consInterval);
 
   std::string y0;
   if (platform->par->extract("casedata", "y0", y0)) {
@@ -205,13 +547,17 @@ void UDF_Setup()
 
 void UDF_ExecuteStep(double time, int tstep)
 {
+  // tstep 0: called once after UDF_Setup, sets the reference scales from the IC
   if (tstep == 0) {
+    reportStatistics(time, tstep);
     return;
   }
 
   // time is the end of the step nekRS just took
   const dfloat dt = nrs->dt[0];
   dgComp::step(time - dt, dt);
+
+  reportStatistics(time, tstep);
 
   if (tstep % 100 == 0) {
     const auto lambda = dgComp::maxWaveSpeed();

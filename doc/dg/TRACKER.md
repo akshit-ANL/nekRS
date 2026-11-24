@@ -19,7 +19,7 @@ The plan and design live in [ROADMAP.md](ROADMAP.md). This file tracks the statu
 - **Machines:** `polaris` (CUDA), `aurora` (DPCPP), `local`.
 - **Bug reports:** use the template at the end of this file.
 
-Last updated: 2026-11-23
+Last updated: 2026-11-24
 
 ---
 
@@ -44,6 +44,7 @@ None of this code has been compiled yet.
 | T-45 | Single-component perfect gas as the default: `[DGCOMP] thermo = perfectGas` (gamma, gasConstant) or `nasa`; `p_perfectGas` kernel branch; `dgComp::setup()` with no arguments; Y optional when nspec = 1 | M1 | done | - | 9953dc2a | DG solver first, multi-species second. nspec = 1 skips the Y output |
 | T-46 | `dgCompHIT.udf`: direct `par->extract` calls in `UDF_Setup0`, checks in `checkCaseData()`; runs with either thermo | M2 | done | - | 9953dc2a | Same pattern as `mv_cyl` |
 | T-47 | `[DGCOMP]` section in `doc/parHelp.txt`; `mw.dat` (O2, N2) shipped with `dgCompHIT` | - | done | - | c336b968 | |
+| T-30 | HIT statistics in `dgCompHIT.udf`: `stat.dat` (`calc_stat`), `stat_ref.dat` (`hit_ref_stat`), `cons.dat` (`check_cons`), same columns and formats as `base.usr`; `[CASEDATA]` mu0, statInterval, consInterval | M2 | done | - | - | Re_lambda uses the constant `mu0` until the transport properties (T-32) exist |
 
 ## 2. Pending (current: M0 and M1)
 
@@ -68,7 +69,6 @@ None of this code has been compiled yet.
 
 | ID | Item | M | Status | Notes |
 |---|---|---|---|---|
-| T-30 | HIT statistics (`calc_stat` to `stat.dat`: urms, lambda, Re_lambda, Mt, Trms, prms) | M2 | todo | Needed for validation against `stat_ref.dat` |
 | T-31 | BR1 viscous kernels (gradient lift, weak divergence) | M2 | todo | |
 | T-32 | `dgCantera` host class (mu, lambda, D_k), Phase A | M2 | todo | |
 | T-33 | `ENABLE_CANTERA` / `CANTERA_DIR` in CMake, with stubs when Cantera is absent | M2 | todo | |

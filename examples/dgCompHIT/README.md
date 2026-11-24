@@ -19,7 +19,39 @@ It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 
 The par file has two user sections:
 - `[DGCOMP]` is read by the plugin: thermo model, species, flux choices, feature switches, and CompNek5000 `userparam01..05` (`dtChem`, `avCstar`, `avCmax`, `avP`, `riemannSolver`).
-- `[CASEDATA]` is read by `dgCompHIT.udf` in `UDF_Setup0`, with plain `platform->par->extract` calls as in the other examples: `boxLength`, `T0`, `p0` and `Y0`. These used to be hard-coded in `base.usr`. `checkCaseData()` checks them in `UDF_Setup`, once the plugin knows nspec.
+- `[CASEDATA]` is read by `dgCompHIT.udf` in `UDF_Setup0`, with plain `platform->par->extract` calls as in the other examples. These used to be hard-coded in `base.usr`. `checkCaseData()` checks them in `UDF_Setup`, once the plugin knows nspec.
+
+| key | meaning | default |
+|---|---|---|
+| `boxLength` | box length L [m] (`base.usr` L0) | required |
+| `T0`, `p0` | initial temperature [K] and pressure [Pa] | required |
+| `Y0` | initial mass fractions, same order as `species` | required for nspec > 1 |
+| `mu0` | dynamic viscosity [Pa s], only used for Re_lambda in `stat.dat` | 0 (Re_lambda written as 0, with a warning) |
+| `statInterval` | steps between `stat.dat` / `stat_ref.dat` rows (`base.usr` sfreq) | 1 |
+| `consInterval` | steps between `cons.dat` rows (`base.usr` cfreq) | 10 |
+
+## Statistics output
+
+The udf ports `calc_stat`, `hit_ref_stat` and `check_cons` from `base.usr`. The files have the same columns and number formats as the CompNek5000 run, so `plot_hit_stats.py` and the Bielawski Fig. A.15 comparison read them unchanged.
+
+- Averages are volume averages, sum(Jw f) / volume, the same as `glsc2(f,bm1,n)/volvm1`.
+- Velocity gradients are element-local, as with `gradm1`.
+- Variances are computed in two passes, about the mean.
+- Everything is computed at tstep 0 from the initial condition, which also sets the reference scales. The scales are printed at startup.
+
+| file | written | columns |
+|---|---|---|
+| `stat.dat` | every `statInterval` steps, from step 1 | `time/tau0  <\|u\|^2>  urms  lambda  Re_lambda  prms  Trms` (E13.5, 6 x E15.7) |
+| `stat_ref.dat` | header and a row at step 0, then every `statInterval` steps | `time  t/tau0  K/K0  omega2*tau0^2  Tvar/Tscale^2  theta2*tau0^2  K  omega2  Tvar  theta2  theta_mean  theta_var` (12 x ES24.16E3). The header line `# scales:` holds K0, tau0, Tscale, Mt0, gamma0, c0 |
+| `cons.dat` | every `consInterval` steps, from step 1 | `time  (m0-m)/m0  (e0-e)/e0` (E13.5, 2 x E15.7) |
+
+Definitions, as in `base.usr`:
+- urms = sqrt(<\|u - <u>\|^2> / 3); lambda = sqrt(urms^2 / <(du/dx)^2>); Re_lambda = urms lambda <rho> / mu0.
+- K = 1.5 urms^2; omega2 = <\|curl u\|^2> (no factor 1/2); theta = div u, theta2 = <theta^2>; Tvar = Trms^2.
+- tau0 = lambda/urms, K0, c0 = <a>, gamma0 = <gamma>, Mt0 = sqrt(3) urms / c0 and Tscale = (gamma0 - 1) <T> Mt0^2, all at step 0.
+- m and e are the integrals of rho and rho E.
+
+Until the transport properties arrive (M2) the viscosity is not computed, so Re_lambda uses the constant `mu0`. The par file sets the Cantera value for air at 300 K and 1e5 Pa, which is what the CompNek5000 run reports at step 0. The other columns do not depend on mu.
 
 ### Thermo model
 

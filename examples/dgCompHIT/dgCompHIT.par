@@ -46,3 +46,6 @@ boxLength = 1.6467320829664873e-4   # base.usr L0 [m]
 T0 = 300.0                 # [K]
 p0 = 1.0e5                 # [Pa]
 Y0 = 0.23, 0.77            # same order as species; nasa only
+mu0 = 1.862349546833299e-5 # [Pa s] Cantera air at T0, p0; only for Re_lambda in stat.dat
+statInterval = 1           # steps between stat.dat / stat_ref.dat rows (base.usr sfreq)
+consInterval = 10          # steps between cons.dat rows (base.usr cfreq)
