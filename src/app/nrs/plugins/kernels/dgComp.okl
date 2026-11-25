@@ -5,6 +5,8 @@
 //   p_perfectGas (1: single component, constant gamma; 0: NASA polynomials),
 //   p_gamma, p_cv (perfect gas only)
 //   p_PRHO, p_PU, p_PV, p_PW, p_PP, p_PT, p_PGAMMA, p_PASPD, p_PH, p_PWMEAN, p_PY0
+//   p_Nvisc (= 4 + p_Nspec for p_Nspec > 1, else 4): BR1 gradient variables
+//   and viscous-flux rows
 //
 // Conserved fields (stride offset): 0..2 rho*u, 3 rho*E, 4.. rho*Y_k.
 // Trace arrays (stride faceOffset): sk = e*p_NfacesNfp + f*p_Nfp + n,
@@ -658,6 +660,464 @@ void fluxHLLC(const dfloat sL,
             }
             rhs[id + q * offset] += s;
           }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Viscous terms (BR1), port of viscous.f, entrovisc.f::liftGrad/divQ_weak and
+// compvar.f transport (vis1, cond1, diff1).
+//
+// Gradient variables g (p_Nvisc of them): 0..2 u, v, w; 3 T; 4+k X_k (mole
+// fractions, nspec > 1 only).
+//   grad[(3 g + d) offset + id]       d(var_g)/dx_d
+// Viscous flux rows q (also p_Nvisc), one per conserved equation that has a
+// viscous term: 0..2 momentum (tau), 3 energy (u.tau + q), 4+k rho Y_k (J_k).
+//   vflux[(3 q + d) offset + id]      F_q,d
+// Signs as in the Fortran, where rkRHS = -dU/dt gets -div: here
+//   dU/dt += div(F), q = +lambda grad T + sum h_k J_k, J_k = +rho D_k W_k/W grad X_k
+// ---------------------------------------------------------------------------
+
+#define p_TinyX 1e-20 // Cantera MixTransport: X_k = max(Tiny, X_k)
+
+// dot product of a 5-term polynomial in ln T (Cantera dot5 with polytempvec)
+dfloat dot5LogT(const dfloat *c, const dfloat *lt)
+{
+  return c[0] + c[1] * lt[1] + c[2] * lt[2] + c[3] * lt[3] + c[4] * lt[4];
+}
+
+// Transport properties at every node, compvar.f lines 158-166:
+//   trans[0 offset] mu, trans[1 offset] lambda, trans[(2+k) offset] rho D_k
+// mode 0 (constant): mu = mu0, lambda = mu cp(T)/Pr, rho D_k = mu/(Pr Le).
+// mode 1 (fits): Cantera mixture-averaged transport (MixTransport, not CK
+// mode) evaluated from its own polynomial fits, exported by
+// exportTransport.py (5 coefficients per fit, ascending powers of ln T):
+//   mu_k = (T^1/4 visc_k(lnT))^2, lambda_k = sqrt(T) cond_k(lnT),
+//   D_jk = T^3/2 diff_jk(lnT) / p
+//   mu = sum_k X_k mu_k / sum_j X_j phi_kj (Wilke, Cantera updateViscosity_T)
+//   lambda = (sum_k X_k lambda_k + 1/sum_k (X_k/lambda_k)) / 2
+//   D_k = (W - X_k W_k) / (p W sum_{j!=k} X_j/D_jk), D_kk/p if that sum <= 0
+// X_k is clipped at 1e-20 as in Cantera; W uses the unclipped mixture.
+@kernel void dgTransport(const dlong N,
+                         const dlong offset,
+                         const int mode,
+                         const dfloat mu0,
+                         const dfloat Pr,
+                         const dfloat Le,
+                         @ restrict const dfloat *aa,
+                         @ restrict const dfloat *mw,
+                         @ restrict const dfloat *viscFit,
+                         @ restrict const dfloat *condFit,
+                         @ restrict const dfloat *diffFit,
+                         @ restrict const dfloat *P,
+                         @ restrict dfloat *trans)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+      const dfloat T = P[n + p_PT * offset];
+      const dfloat rho = P[n + p_PRHO * offset];
+      dfloat Y[p_Nspec];
+      for (int k = 0; k < p_Nspec; k++) {
+        Y[k] = P[n + (p_PY0 + k) * offset];
+      }
+
+      if (mode == 0) {
+        dfloat cp = 0;
+        for (int k = 0; k < p_Nspec; k++) {
+          dfloat cpk = aa[k * p_Npa + p_Npa - 1];
+          for (int c = p_Npa - 2; c >= 0; c--) {
+            cpk = cpk * T + aa[k * p_Npa + c];
+          }
+          cp += Y[k] * cpk;
+        }
+        trans[n + 0 * offset] = mu0;
+        trans[n + 1 * offset] = mu0 * cp / Pr;
+        for (int k = 0; k < p_Nspec; k++) {
+          trans[n + (2 + k) * offset] = mu0 / (Pr * Le);
+        }
+      } else {
+        const dfloat p = P[n + p_PP * offset];
+        const dfloat W = P[n + p_PWMEAN * offset];
+        const dfloat sqrtT = sqrt(T);
+        const dfloat t14 = sqrt(sqrtT);
+
+        dfloat lt[5];
+        lt[0] = 1;
+        lt[1] = log(T);
+        lt[2] = lt[1] * lt[1];
+        lt[3] = lt[2] * lt[1];
+        lt[4] = lt[3] * lt[1];
+
+        dfloat X[p_Nspec], sqmu[p_Nspec], muk[p_Nspec];
+        dfloat sum1 = 0, sum2 = 0;
+        for (int k = 0; k < p_Nspec; k++) {
+          X[k] = fmax(p_TinyX, Y[k] * W / mw[k]);
+          sqmu[k] = t14 * dot5LogT(viscFit + 5 * k, lt);
+          muk[k] = sqmu[k] * sqmu[k];
+          const dfloat lamk = sqrtT * dot5LogT(condFit + 5 * k, lt);
+          sum1 += X[k] * lamk;
+          sum2 += X[k] / lamk;
+        }
+
+        dfloat mu = 0;
+        for (int k = 0; k < p_Nspec; k++) {
+          dfloat den = 0;
+          for (int j = 0; j < p_Nspec; j++) {
+            // phi_kj = (1 + sqrt(mu_k/mu_j) (W_j/W_k)^1/4)^2 / sqrt(8 (1 + W_k/W_j))
+            const dfloat f1 = 1 + (sqmu[k] / sqmu[j]) * sqrt(sqrt(mw[j] / mw[k]));
+            den += X[j] * f1 * f1 / sqrt(8 * (1 + mw[k] / mw[j]));
+          }
+          mu += X[k] * muk[k] / den;
+        }
+
+        trans[n + 0 * offset] = mu;
+        trans[n + 1 * offset] = 0.5 * (sum1 + 1 / sum2);
+
+        const dfloat T32 = T * sqrtT;
+        for (int k = 0; k < p_Nspec; k++) {
+          const dfloat Dkk = T32 * dot5LogT(diffFit + 5 * (k * p_Nspec + k), lt);
+          dfloat Dk = Dkk / p;
+#if p_Nspec > 1
+          dfloat s = 0;
+          for (int j = 0; j < p_Nspec; j++) {
+            if (j != k) {
+              s += X[j] / (T32 * dot5LogT(diffFit + 5 * (j * p_Nspec + k), lt));
+            }
+          }
+          if (s > 0) {
+            Dk = (W - X[k] * mw[k]) / (p * W * s);
+          }
+#endif
+          trans[n + (2 + k) * offset] = rho * Dk;
+        }
+      }
+    }
+  }
+}
+
+// gradient variable g at volume node id
+dfloat viscVar(const int g, const dlong id, const dlong offset, const dfloat *P, const dfloat *mw)
+{
+  if (g < 3) {
+    return P[id + (p_PU + g) * offset];
+  }
+  if (g == 3) {
+    return P[id + p_PT * offset];
+  }
+  const int k = g - 4;
+  return P[id + (p_PY0 + k) * offset] * P[id + p_PWMEAN * offset] / mw[k];
+}
+
+// BR1 lift of gradient variable g from trace node sk (liftGrad, Zhang & Peet
+// 2023 eq. 50): gr += n (avg - own) sJ w / (J w) = n (P - M)/2 sJ w / (J w).
+// faceP holds M + P, so P = faceP - faceM.
+void br1GradLift(const dlong sk,
+                 const int g,
+                 const dlong faceOffset,
+                 const dfloat *sgeo,
+                 const dfloat *faceM,
+                 const dfloat *faceP,
+                 const dfloat *mw,
+                 dfloat *gr)
+{
+#define trM(fld) faceM[sk + (p_Neq + (fld)) * faceOffset]
+#define trP(fld) (faceP[sk + (p_Neq + (fld)) * faceOffset] - trM(fld))
+  dfloat jump;
+  if (g < 3) {
+    jump = trP(p_PU + g) - trM(p_PU + g);
+  } else if (g == 3) {
+    jump = trP(p_PT) - trM(p_PT);
+  } else {
+    const int k = g - 4;
+    jump = (trP(p_PY0 + k) * trP(p_PWMEAN) - trM(p_PY0 + k) * trM(p_PWMEAN)) / mw[k];
+  }
+#undef trM
+#undef trP
+  const dfloat c = 0.5 * jump * sgeo[sk * p_Nsgeo + p_WSJID] * sgeo[sk * p_Nsgeo + p_IJWID];
+  gr[0] += c * sgeo[sk * p_Nsgeo + p_NXID];
+  gr[1] += c * sgeo[sk * p_Nsgeo + p_NYID];
+  gr[2] += c * sgeo[sk * p_Nsgeo + p_NZID];
+}
+
+// BR1 gradient of variable g (entrovisc.f::liftGrad): strong-form derivative
+// (dgdiv.f::dgGrad_strong) plus the lift above, written to grad rows 3g..3g+2.
+// One launch per variable. Face node ordering as in dgSurfaceLiftHex3D.
+@kernel void dgViscGradHex3D(const dlong Nelements,
+                             const dlong offset,
+                             const dlong faceOffset,
+                             const int g,
+                             @ restrict const dfloat *vgeo,
+                             @ restrict const dfloat *sgeo,
+                             @ restrict const dfloat *D,
+                             @ restrict const dfloat *mw,
+                             @ restrict const dfloat *P,
+                             @ restrict const dfloat *faceM,
+                             @ restrict const dfloat *faceP,
+                             @ restrict dfloat *grad)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_q[p_Nq][p_Nq][p_Nq];
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        s_D[j][i] = D[j * p_Nq + i];
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          s_q[k][j][i] = viscVar(g, id, offset, P, mw);
+        }
+      }
+    }
+
+    @barrier();
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        const dlong base = e * p_NfacesNfp;
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          const dlong gid = e * p_Np * p_Nvgeo + k * p_Nfp + j * p_Nq + i;
+
+          dfloat dr = 0, ds = 0, dt = 0;
+          for (int l = 0; l < p_Nq; ++l) {
+            dr += s_D[i][l] * s_q[k][j][l];
+            ds += s_D[j][l] * s_q[k][l][i];
+            dt += s_D[k][l] * s_q[l][j][i];
+          }
+
+          dfloat gr[3];
+          gr[0] = vgeo[gid + p_RXID * p_Np] * dr + vgeo[gid + p_SXID * p_Np] * ds + vgeo[gid + p_TXID * p_Np] * dt;
+          gr[1] = vgeo[gid + p_RYID * p_Np] * dr + vgeo[gid + p_SYID * p_Np] * ds + vgeo[gid + p_TYID * p_Np] * dt;
+          gr[2] = vgeo[gid + p_RZID * p_Np] * dr + vgeo[gid + p_SZID * p_Np] * ds + vgeo[gid + p_TZID * p_Np] * dt;
+
+          if (k == 0) {
+            br1GradLift(base + 0 * p_Nfp + i + j * p_Nq, g, faceOffset, sgeo, faceM, faceP, mw, gr);
+          }
+          if (k == p_Nq - 1) {
+            br1GradLift(base + 5 * p_Nfp + i + j * p_Nq, g, faceOffset, sgeo, faceM, faceP, mw, gr);
+          }
+          if (j == 0) {
+            br1GradLift(base + 1 * p_Nfp + i + k * p_Nq, g, faceOffset, sgeo, faceM, faceP, mw, gr);
+          }
+          if (j == p_Nq - 1) {
+            br1GradLift(base + 3 * p_Nfp + i + k * p_Nq, g, faceOffset, sgeo, faceM, faceP, mw, gr);
+          }
+          if (i == 0) {
+            br1GradLift(base + 4 * p_Nfp + j + k * p_Nq, g, faceOffset, sgeo, faceM, faceP, mw, gr);
+          }
+          if (i == p_Nq - 1) {
+            br1GradLift(base + 2 * p_Nfp + j + k * p_Nq, g, faceOffset, sgeo, faceM, faceP, mw, gr);
+          }
+
+          for (int d = 0; d < 3; d++) {
+            grad[id + (3 * g + d) * offset] = gr[d];
+          }
+        }
+      }
+    }
+  }
+}
+
+// Viscous flux vectors at every node (viscous.f::eval_visc_U, eval_visc_EY):
+//   tau_ab = mu (du_a/dx_b + du_b/dx_a) - 2/3 mu div(u) delta_ab
+//   J_k    = rho D_k W_k/W grad X_k, then J_k -= Y_k sum_j J_j
+//   energy = u.tau + lambda grad T + sum_k h_k J_k
+// h_k = u_k(T) + Ru T/W_k from the bi polynomials, the same per-mass enthalpy
+// as compvar.f hh.
+@kernel void dgViscFlux(const dlong N,
+                        const dlong offset,
+                        @ restrict const dfloat *bi,
+                        @ restrict const dfloat *mw,
+                        @ restrict const dfloat *P,
+                        @ restrict const dfloat *trans,
+                        @ restrict const dfloat *grad,
+                        @ restrict dfloat *vflux)
+{
+  for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+    if (n < N) {
+#define G(g, d) grad[n + (3 * (g) + (d)) * offset]
+#define VF(q, d) vflux[n + (3 * (q) + (d)) * offset]
+      const dfloat mu = trans[n + 0 * offset];
+      const dfloat lambda = trans[n + 1 * offset];
+      dfloat vel[3];
+      vel[0] = P[n + p_PU * offset];
+      vel[1] = P[n + p_PV * offset];
+      vel[2] = P[n + p_PW * offset];
+
+      const dfloat divu = G(0, 0) + G(1, 1) + G(2, 2);
+      dfloat qE[3];
+      for (int d = 0; d < 3; d++) {
+        qE[d] = lambda * G(3, d);
+      }
+      for (int a = 0; a < 3; a++) {
+        for (int b = 0; b < 3; b++) {
+          dfloat tau = mu * (G(a, b) + G(b, a));
+          if (a == b) {
+            tau -= (2.0 / 3.0) * mu * divu;
+          }
+          VF(a, b) = tau;
+          qE[b] += vel[a] * tau;
+        }
+      }
+
+#if p_Nspec > 1
+      const dfloat T = P[n + p_PT * offset];
+      const dfloat W = P[n + p_PWMEAN * offset];
+      dfloat J[p_Nspec][3];
+      dfloat Jsum[3] = {0, 0, 0};
+      for (int k = 0; k < p_Nspec; k++) {
+        const dfloat c = trans[n + (2 + k) * offset] * mw[k] / W;
+        for (int d = 0; d < 3; d++) {
+          J[k][d] = c * G(4 + k, d);
+          Jsum[d] += J[k][d];
+        }
+      }
+      for (int k = 0; k < p_Nspec; k++) {
+        const dfloat Yk = P[n + (p_PY0 + k) * offset];
+        dfloat hk = bi[k * (p_Npa + 1) + p_Npa];
+        for (int c = p_Npa - 1; c >= 0; c--) {
+          hk = hk * T + bi[k * (p_Npa + 1) + c];
+        }
+        hk += p_Ru * T / mw[k];
+        for (int d = 0; d < 3; d++) {
+          J[k][d] -= Yk * Jsum[d];
+          qE[d] += hk * J[k][d];
+          VF(4 + k, d) = J[k][d];
+        }
+      }
+#endif
+
+      for (int d = 0; d < 3; d++) {
+        VF(3, d) = qE[d];
+      }
+#undef G
+#undef VF
+    }
+  }
+}
+
+// Normal component F_q.n of the own viscous flux at every trace node, for
+// the face exchange (one field per row q instead of three: the neighbour's
+// normal is -n, so after the gs-add vfaceP - vfaceM = -F_q(P).n).
+@kernel void dgViscTraceGather(const dlong Nelements,
+                               const dlong offset,
+                               const dlong faceOffset,
+                               @ restrict const dlong *vmapM,
+                               @ restrict const dfloat *sgeo,
+                               @ restrict const dfloat *vflux,
+                               @ restrict dfloat *vfaceM)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    for (int n = 0; n < p_NfacesNfp; ++n; @inner(0)) {
+      const dlong sk = e * p_NfacesNfp + n;
+      const dlong idM = vmapM[sk];
+      const dfloat nx = sgeo[sk * p_Nsgeo + p_NXID];
+      const dfloat ny = sgeo[sk * p_Nsgeo + p_NYID];
+      const dfloat nz = sgeo[sk * p_Nsgeo + p_NZID];
+      for (int q = 0; q < p_Nvisc; q++) {
+        vfaceM[sk + q * faceOffset] = vflux[idM + (3 * q + 0) * offset] * nx +
+                                      vflux[idM + (3 * q + 1) * offset] * ny +
+                                      vflux[idM + (3 * q + 2) * offset] * nz;
+      }
+    }
+  }
+}
+
+// central BR1 face flux of row q at trace node sk (divQ_weak, Zhang & Peet
+// 2023 eq. 53): (F_M + F_P)/2 . n_M sJ w / (J w). vfaceP holds
+// F_M.n_M + F_P.n_P with n_P = -n_M, so (F_M + F_P)/2 . n_M = vfaceM - vfaceP/2.
+dfloat br1DivFace(const dlong sk, const int q, const dlong faceOffset, const dfloat *sgeo, const dfloat *vfaceM,
+                  const dfloat *vfaceP)
+{
+  return (vfaceM[sk + q * faceOffset] - 0.5 * vfaceP[sk + q * faceOffset]) * sgeo[sk * p_Nsgeo + p_WSJID] *
+         sgeo[sk * p_Nsgeo + p_IJWID];
+}
+
+// Weak-form BR1 divergence of viscous flux row q (entrovisc.f::divQ_weak),
+// added to rhs row q:
+//   rhs += face term above
+//        - 1/(J w)_ijk [ sum_l D_li Fr_ljk + D_lj Fs_ilk + D_lk Ft_ijl ]
+// with the contravariant fluxes Fr = J w (rx Fx + ry Fy + rz Fz), etc.
+// This is the exact weak form on curved elements. dgdiv.f::dgGrad_weak uses
+// the metrics of node ijk and only the weight ratio of the derivative
+// direction; the two agree on axis-aligned affine meshes such as the HIT box
+// (see doc/dg/IMPLEMENTATION.md).
+// One launch per row q.
+@kernel void dgViscDivHex3D(const dlong Nelements,
+                            const dlong offset,
+                            const dlong faceOffset,
+                            const int q,
+                            @ restrict const dfloat *vgeo,
+                            @ restrict const dfloat *sgeo,
+                            @ restrict const dfloat *D,
+                            @ restrict const dfloat *vflux,
+                            @ restrict const dfloat *vfaceM,
+                            @ restrict const dfloat *vfaceP,
+                            @ restrict dfloat *rhs)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_Fr[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_Fs[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_Ft[p_Nq][p_Nq][p_Nq];
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        s_D[j][i] = D[j * p_Nq + i];
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          const dlong gid = e * p_Np * p_Nvgeo + k * p_Nfp + j * p_Nq + i;
+          const dfloat JW = vgeo[gid + p_JWID * p_Np];
+          const dfloat Fx = vflux[id + (3 * q + 0) * offset];
+          const dfloat Fy = vflux[id + (3 * q + 1) * offset];
+          const dfloat Fz = vflux[id + (3 * q + 2) * offset];
+          s_Fr[k][j][i] =
+              JW * (vgeo[gid + p_RXID * p_Np] * Fx + vgeo[gid + p_RYID * p_Np] * Fy + vgeo[gid + p_RZID * p_Np] * Fz);
+          s_Fs[k][j][i] =
+              JW * (vgeo[gid + p_SXID * p_Np] * Fx + vgeo[gid + p_SYID * p_Np] * Fy + vgeo[gid + p_SZID * p_Np] * Fz);
+          s_Ft[k][j][i] =
+              JW * (vgeo[gid + p_TXID * p_Np] * Fx + vgeo[gid + p_TYID * p_Np] * Fy + vgeo[gid + p_TZID * p_Np] * Fz);
+        }
+      }
+    }
+
+    @barrier();
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        const dlong base = e * p_NfacesNfp;
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          const dlong gid = e * p_Np * p_Nvgeo + k * p_Nfp + j * p_Nq + i;
+
+          dfloat s = 0;
+          for (int l = 0; l < p_Nq; ++l) {
+            s += s_D[l][i] * s_Fr[k][j][l] + s_D[l][j] * s_Fs[k][l][i] + s_D[l][k] * s_Ft[l][j][i];
+          }
+          dfloat div = -s * vgeo[gid + p_IJWID * p_Np];
+
+          if (k == 0) {
+            div += br1DivFace(base + 0 * p_Nfp + i + j * p_Nq, q, faceOffset, sgeo, vfaceM, vfaceP);
+          }
+          if (k == p_Nq - 1) {
+            div += br1DivFace(base + 5 * p_Nfp + i + j * p_Nq, q, faceOffset, sgeo, vfaceM, vfaceP);
+          }
+          if (j == 0) {
+            div += br1DivFace(base + 1 * p_Nfp + i + k * p_Nq, q, faceOffset, sgeo, vfaceM, vfaceP);
+          }
+          if (j == p_Nq - 1) {
+            div += br1DivFace(base + 3 * p_Nfp + i + k * p_Nq, q, faceOffset, sgeo, vfaceM, vfaceP);
+          }
+          if (i == 0) {
+            div += br1DivFace(base + 4 * p_Nfp + j + k * p_Nq, q, faceOffset, sgeo, vfaceM, vfaceP);
+          }
+          if (i == p_Nq - 1) {
+            div += br1DivFace(base + 2 * p_Nfp + j + k * p_Nq, q, faceOffset, sgeo, vfaceM, vfaceP);
+          }
+
+          rhs[id + q * offset] += div;
         }
       }
     }

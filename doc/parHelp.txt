@@ -310,8 +310,20 @@ blendSwRho                  <float>                                    hllcBlend
 volumeFlux                  kep [D], ec                                kinetic-energy preserving or entropy conserving
                                                                        (ec not implemented yet)
 
-viscous                     true, false [D]
-reacting                    true, false [D]
+viscous                     true, false [D]                            BR1 viscous terms (periodic meshes only)
+
+transport                   constant, fits                             viscous only. constant: mu, prandtl, lewis
+                            fits [D] for nasa                          fits: Cantera mixture-averaged transport from
+                            constant [D] for perfectGas                visc.dat, cond.dat, diff.dat (see below)
+
+mu                          <float>                                    dynamic viscosity in Pa s
+                                                                       transport = constant: mandatory
+prandtl                     <float>                                    transport = constant: lambda = mu cp(T)/prandtl
+                            0.72 [D]
+lewis                       <float>                                    transport = constant: rho D_k = mu/(prandtl lewis)
+                            1.0 [D]
+
+reacting                   true, false [D]
 splitChemistry              true, false [D]                            Strang-split chemistry when reacting
 clip                        true, false [D]                            clip T in the Newton solve
 positivityLimiter           true, false [D]                            Zhang-Shu
@@ -333,6 +345,11 @@ thermo = nasa reads these files from the case directory, nspec per file in speci
   h0.dat                    nspec values                               enthalpy at 298.15 K, J/kg
   s0.dat                    nspec values                               entropy at 298.15 K and 101325 Pa, J/(kg K)
   mw.dat                    nspec values                               molar mass, g/mol
+viscous = true with transport = fits also reads (examples/dgCompHIT/exportTransport.py writes them):
+  visc.dat                  nspec rows of 5                            sqrt(mu_k)/T^(1/4), polynomial in ln T
+  cond.dat                  nspec rows of 5                            lambda_k/sqrt(T), polynomial in ln T
+  diff.dat                  nspec*nspec rows of 5 (full matrix)        p D_jk/T^(3/2), polynomial in ln T
+Coefficients are Cantera's own MixTransport fits, ascending powers of ln T, SI units.
 Fortran D exponents and commas are accepted. No Cantera mechanism (.yaml) is read at run time.
 
 ----------------------------------------------------------------------------------------------------------------------

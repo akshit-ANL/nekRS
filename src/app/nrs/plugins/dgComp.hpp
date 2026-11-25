@@ -28,7 +28,14 @@
 //   blendSw1 = 0.1            # hllcBlend: ... where it is pure HLL, <= blendSw0 means 10 blendSw0 (userparam07)
 //   blendSwRho = 0.1          # hllcBlend: density-jump damping at subsonic faces (userparam08)
 //   volumeFlux = kep          # kep | ec        (ifVolEC; ec not implemented yet)
-//   viscous = yes             # ifviscous
+//   viscous = yes             # ifviscous: BR1 viscous terms (fully periodic meshes for now)
+//   transport = fits          # constant | fits; default fits for nasa, constant for perfectGas
+//                             #   fits: Cantera mixture-averaged transport evaluated from its
+//                             #   polynomial fits in visc.dat, cond.dat, diff.dat
+//                             #   (examples/dgCompHIT/exportTransport.py), no Cantera at run time
+//   mu = 1.8e-5               # constant only (required): dynamic viscosity [Pa s]
+//   prandtl = 0.72            # constant only: lambda = mu cp(T)/prandtl
+//   lewis = 1.0               # constant only: rho D_k = mu/(prandtl lewis)
 //   reacting = no             # ifforces
 //   splitChemistry = no       # ifsplitchem
 //   clip = no                 # ifclip

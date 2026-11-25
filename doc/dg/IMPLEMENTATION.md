@@ -42,9 +42,14 @@ Case-specific code from `base.usr` (initial condition, statistics) lives in the 
 | `ifviscous, ifavisc, ifsplitchem, ifclip, ifpplim, ifIntLLFfull, ifVolEC` (`comp_flags*`) | `opt` struct in `dgComp.cpp`, filled from the `[DGCOMP]` par section (`viscous`, `artificialViscosity`, `splitChemistry`, `clip`, `positivityLimiter`, `fullInterfaceLLF`, `volumeFlux = kep / ec`) |
 | `uparam(1..5)` | `[DGCOMP] dtChem, avCstar, avCmax, avP, riemannSolver` (`llf, hll, hllc, hllcBlend` = 0..3) |
 | `uparam(6..8)` (blend switch, `riemann.f`) | `[DGCOMP] blendSw0, blendSw1, blendSwRho`, same fallbacks (0.01, 10·sw0, 0.1) |
-| `lmf, enmu, enhe, rhoS1/2, vis1, cond1, diff1, wdot, ss` | not allocated yet (M2 to M4) |
+| `vis1, cond1, diff1` (μ, λ, ρD_k) | `o_trans`, `p_Nspec + 2` fields: μ, λ, ρD_k (viscous only) |
+| BR1 gradients (`gradU`, `gradT`, ...), viscous fluxes, their face traces | `o_grad` (`3·Nvisc` fields, `[(3g+d)·offset]`), `o_vflux` (same layout), `o_vfaceM` / `o_vfaceP` (`Nvisc` normal-flux fields of stride `faceOffset`) |
+| Cantera transport fits (inside Cantera) | `o_viscFit`, `o_condFit`, `o_diffFit` from `visc/cond/diff.dat` |
+| `lmf, enmu, enhe, rhoS1/2, wdot, ss` | not allocated yet (M3 to M4) |
 
-Primitives with no nekRS field yet: `spd`, `mach`, `ss`/`si` (entropy), `Xi` (mole fractions), transport, `wdot`.
+`Nvisc = 4 + (nspec > 1 ? nspec : 0)`: the gradient variables are u, v, w, T and, for a mixture, X_k. The viscous fluxes reuse the same count: ρu, ρv, ρw, ρE and ρY_k.
+
+Primitives with no nekRS field yet: `spd`, `mach`, `ss`/`si` (entropy), `Xi` (mole fractions; computed on the fly in the viscous kernels), `wdot`.
 
 ### Call flow per time step
 
@@ -58,7 +63,13 @@ nekRS time loop (solver = none, so nekRS only advances time and writes checkpoin
    │       │   ├─ dgTraceGather + oogs add      [fluxLF.f::sum_neighbor_vars]
    │       │   ├─ dgVolumeRhsHex3D  (KEP)       [advect.f::advect_volInt, getFlux_KEP]
    │       │   ├─ dgSurfaceFluxHex3D            [advect.f::advect_interface, fluxLF.f::eval_lmf, riemann.f]
-   │       │   └─ dgSurfaceLiftHex3D            [the area/bm1 lift inside advect_interface]
+   │       │   ├─ dgSurfaceLiftHex3D            [the area/bm1 lift inside advect_interface]
+   │       │   └─ viscous = yes:                [dgrhs.f -> viscous.f::viscous]
+   │       │       ├─ dgTransport               [compvar.f vis1/cond1/diff1, Cantera MixTransport]
+   │       │       ├─ dgViscGradHex3D × Nvisc   [dgdiv.f::dgGrad_weak + entrovisc.f::liftGrad]
+   │       │       ├─ dgViscFlux                [viscous.f::eval_visc_U, eval_visc_EY]
+   │       │       ├─ dgViscTraceGather + oogs  [full2face of F·n + gs_op add]
+   │       │       └─ dgViscDivHex3D × Nvisc    [entrovisc.f::divQ_weak]
    │       ├─ dgSSPRKStage                      [SSPRK3 stage update]
    │       └─ dgPrimitives                      [compvar.f::eval_dependent_vars]
    │   └─ copyToFluid (u, p into nrs->fluid for checkpoints)
@@ -67,7 +78,12 @@ nekRS time loop (solver = none, so nekRS only advances time and writes checkpoin
 
 **Sign convention:** the Fortran `rkRHS` is −dU/dt. `o_rhs` in nekRS is +dU/dt. Keep this in mind when you compare dumps.
 
-**The RHS is inviscid only.** `viscous = yes` prints a warning and runs inviscid until BR1 (T-31) and the transport properties (T-32) land. So a nekRS run matches a Nek5000 run with `ifviscous = .false.`, not the viscous compHIT reference. Setup aborts on any boundary face (fully periodic meshes only, until T-36).
+**Viscous terms (BR1, T-31) and transport (T-50) are written but not compiled yet.** With `viscous = no` a nekRS run matches a Nek5000 run with `ifviscous = .false.`; the inviscid HLLC compHIT matches to 12-13 digits (TRACKER B-05). Setup aborts on any boundary face (fully periodic meshes only, until T-36).
+
+**BR1 in nekRS form.**
+- Gradient: strong derivative in each element plus the central lift ½(q_P − q_M)·n·WSJ·IJW on each face node. The exchanged q are the M+P primitives already in `o_faceP`, so there is no second exchange for the gradients.
+- Divergence: weak form, −IJW·Σ_l (D_li F̂r + D_lj F̂s + D_lk F̂t) with F̂r = JW·(rx Fx + ry Fy + rz Fz), plus the central face flux ½(F_M + F_P)·n. Only F·n_M is exchanged, one field per conserved equation.
+- Full metrics at every node. The Fortran `dgGrad_weak` uses node-i metrics and a single weight ratio, which is the same on the affine HIT box but not on curved meshes (TRACKER B-04).
 
 **Surface term in two kernels.** `dgSurfaceFluxHex3D` runs once per face node and writes the numerical-flux correction `−(F* − F_M)·WSJ·IJW` (= Fortran `(F* − F_L)·area/bm1` with the sign flip) to `o_faceFlux`. `dgSurfaceLiftHex3D` runs per element; thread (i,j) owns column k, so it adds the faces touching each node without atomics or a race.
 
@@ -106,7 +122,8 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `eval_dependent_vars` | `dgComp::computePrimitives` → `dgPrimitives` | partial | ported: ρ, Y (with clip), W̄, u, T (Newton), γ, a, h, p. Not yet: μ, λ, D_k (T-32), ω̇ (T-40), entropy `ss`/`si` (T-37/T-38), Mach |
+| `eval_dependent_vars` | `dgComp::computePrimitives` → `dgPrimitives` | partial | ported: ρ, Y (with clip), W̄, u, T (Newton), γ, a, h, p. μ, λ, ρD_k are in the separate `dgTransport` kernel (T-50). Not yet: ω̇ (T-40), entropy `ss`/`si` (T-37/T-38), Mach |
+| (transport part of `eval_dependent_vars`: `viscosity`, `thermalconductivity`, `getmixdiffcoeffs`) | `dgTransport` | ported, not compiled | T-50. Mode 1 (`transport = fits`): Cantera `MixTransport` formulas from the fits in `visc/cond/diff.dat`. Mode 0 (`constant`): μ, λ = μ cp/Pr, ρD = μ/(Pr Le). Writes ρD_k, as `diff1` holds |
 | (Newton for T inside `eval_dependent_vars`) | `dgPrimitives`, `#if !p_perfectGas` | ported | same start (500 K), tolerance (1e-8), cap (1000). The species sum is folded into mixture coefficients before the loop, which is algebraically identical |
 | — | `dgPrimitives`, `#if p_perfectGas` | new | `thermo = perfectGas`: T = e/cv, constant γ |
 | `eval_EOS_D` | inline in `dgConserved` | ported | ρ = p W̄ / (Ru T) |
@@ -147,7 +164,7 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `getdgrhs` | `computeRhs` | partial | inviscid part ported; viscous, AV and source hooks are TODO comments |
+| `getdgrhs` | `computeRhs` | partial | inviscid and viscous (BR1) parts ported; AV and source hooks are TODO comments |
 | `compf` (ω̇ in the species RHS, unsplit) | — | todo | T-40 (M4) |
 
 ### compbc.f — boundary conditions
@@ -169,23 +186,29 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `dgGrad_strong`, `dudxyz_strong`, `dgGrad_weak` | — | todo | T-31 |
-| `viscous`, `eval_dudx`, `eval_visc_U`, `eval_visc_EY` | hook comment in `computeRhs` | todo | T-31; `viscous = yes` currently prints a warning and runs inviscid |
+| `dgGrad_weak` + `liftGrad` (BR1 gradient) | `dgViscGradHex3D` (`br1GradLift` for the face term) | ported, not compiled | T-31. Strong form with central lift, equivalent to weak form + lift on any mesh; full metrics (B-04) |
+| `dgGrad_strong`, `dudxyz_strong` | — | n/a | not on the BR1 path used by compHIT |
+| `viscous` | `computeRhs` (`opt.viscous` block) | ported, not compiled | T-31 |
+| `eval_dudx` | `dgViscGradHex3D` on u, v, w (`viscVar`) | ported, not compiled | |
+| `eval_visc_U` (τ, u·τ, λ∇T) | `dgViscFlux` | ported, not compiled | τ = μ(∇u + ∇uᵀ) − ⅔μ(∇·u)I |
+| `eval_visc_EY` (species diffusion, Σ h_k J_k) | `dgViscFlux`, `#if p_Nspec > 1` | ported, not compiled | viscous species flux ρD_k (W_k/W̄)∇X_k minus Y_k times its sum over k (zero net mass flux); the energy flux adds Σ h_k of it, h_k from `bi` plus Ru T / W_k |
 
 ### entrovisc.f — entropy viscosity
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
 | `entrovisc` | — | todo | T-38 |
-| `liftGrad`, `divQ_strong`, `divQ_weak` | — | todo | shared with BR1 (T-31) |
+| `liftGrad` | `br1GradLift` in `dgViscGradHex3D` | ported, not compiled | T-31; reused by T-38 |
+| `divQ_weak` | `dgViscDivHex3D` (`br1DivFace` for the face term) + `dgViscTraceGather` + oogs | ported, not compiled | T-31; reused by T-38 |
+| `divQ_strong` | — | n/a | not on the BR1 path |
 | `eval_enmu`, `eval_enhe`, `eval_lmf_visc_reg` | — | todo | T-38; setup aborts if `artificialViscosity = yes` |
 
 ### cantera_stubs.f and core/ftnlib.cpp — Cantera
 
 | Fortran / C++ | nekRS | status | notes / task |
 |---|---|---|---|
-| `newIdealGasMix`, `getmolecularweights` (in `usrdat`) | `dgComp::readThermo` reads `mw.dat` | partial | temporary until T-32/T-34 |
-| `viscosity`, `thermalconductivity`, `getmixdiffcoeffs` | — | todo | T-32 (host, M2), T-41 (GPU, M5) |
+| `newIdealGasMix`, `getmolecularweights` (in `usrdat`) | `dgComp::readThermo` reads `mw.dat` | partial | `exportTransport.py` writes `mw.dat` from Cantera; T-34 for a run-time bridge |
+| `viscosity`, `thermalconductivity`, `getmixdiffcoeffs` | `dgTransport` (GPU) from the fits `exportTransport.py` writes | ported, not compiled | T-50; replaces T-32/T-41 for transport. Cantera default (non-CK) mixture-averaged model |
 | `getnetproductionrates`, `setstate_uv`, `setmassfractions` | — | todo | T-39/T-42 |
 | `cantera_stub_abort` and the other stubs | — | todo | T-33 (stubs when built without Cantera) |
 
@@ -227,9 +250,10 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
   - The nekRS startup prints urms0, lambda0 and tau0. The first `stat_ref.dat` row has the full set.
   - For compHIT the expected values are urms0 = 120.50, lambda0 = 1.3367e-5 and tau0 = 1.109e-7.
   - p = p0 and T = T0 are uniform in both codes at t = 0.
-- **The inviscid fluxes are in (T-18, T-19), the viscous terms are not.**
+- **Inviscid runs (`viscous = no`).**
   - Compare against a Nek5000 run with `ifviscous = .false.`, the same `ifVolEC = .false.` (KEP), the same `uparam(5)` / `riemannSolver`, `ifIntLLFfull` / `fullInterfaceLLF`, and the same fixed dt.
-  - The viscous reference (urms 58.7 m/s at 4.5 τ0) cannot match until T-31 and T-32 land. An inviscid run decays more slowly; only numerical dissipation removes energy.
+  - HLLC at dt = 1e-10 agrees to 12-13 digits until CompNek5000 goes NaN at 3.99e-8 s; nekRS goes NaN at 4.51e-8 s. Inviscid KEP is not entropy stable, so the exact crash time is set by round-off (TRACKER B-05).
+- **Viscous runs (`viscous = yes`).** The reference is urms 58.7 m/s at 4.5 τ0. The transport must be the same Cantera mixture-averaged model on both sides (`transport = fits`).
 - **Step-0 RHS is the sharpest check (T-22).**
   - Dump `rkRHS` from CompNek5000 after the first `getdgrhs` and `o_rhs` from nekRS after the first `computeRhs`; they should agree to round-off with the sign flipped (§2).
   - Then compare one full SSPRK3 step field by field.

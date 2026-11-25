@@ -11,11 +11,12 @@
 
 #include "dgComp.hpp"
 
-// Status (M1, inviscid): primitives (perfect gas, or NASA mixture with
-// Newton for T), trace gather and face exchange, KEP flux-differencing volume
-// term, LLF / HLL / HLLC / blended interface flux, SSPRK3 and the wave-speed
-// reduction. Not yet: EC volume flux, boundary conditions, viscous terms
-// (BR1), chemistry, positivity limiter, artificial viscosity.
+// Status (M2): primitives (perfect gas, or NASA mixture with Newton for T),
+// trace gather and face exchange, KEP flux-differencing volume term, LLF /
+// HLL / HLLC / blended interface flux, BR1 viscous terms with constant or
+// Cantera-fit (mixture-averaged) transport, SSPRK3 and the wave-speed
+// reduction. Not yet: EC volume flux, boundary conditions, chemistry,
+// positivity limiter, artificial viscosity.
 // See doc/dg/ROADMAP.md.
 
 namespace
@@ -36,6 +37,9 @@ int npa = 5;
 int nEq = 0;
 int nPrim = 0;
 int nTrace = 0;
+// BR1: gradient variables u, v, w, T (+ X_k for nspec > 1) and viscous-flux
+// rows (3 momentum, energy, + rho Y_k for nspec > 1); same count
+int nVisc = 0;
 
 dlong fieldOffset = 0;
 dlong faceOffset = 0;
@@ -57,6 +61,13 @@ struct options_t {
   bool positivityLimiter = false;
   bool artificialViscosity = false;
   bool fullInterfaceLLF = false;
+
+  // viscous = yes: transport = constant (mu, prandtl, lewis) or fits
+  // (Cantera mixture-averaged fits from visc.dat, cond.dat, diff.dat)
+  int transport = 0; // 0 constant, 1 fits
+  dfloat mu = 0;
+  dfloat prandtl = 0.72;
+  dfloat lewis = 1.0;
 
   // CompNek5000 userparam01..04 (base.par of compHIT)
   dfloat dtChem = 0;    // uparam(1), chemistry sub-step (M4)
@@ -80,6 +91,17 @@ occa::memory o_mw;
 
 oogs_t *gshFace = nullptr;
 
+// viscous terms (allocated only with viscous = yes)
+occa::memory o_trans;  // mu, lambda, rho D_k: (2 + nspec) fields
+occa::memory o_grad;   // BR1 gradients, 3*nVisc fields, row 3g+d
+occa::memory o_vflux;  // viscous fluxes, 3*nVisc fields, row 3q+d
+occa::memory o_vfaceM; // F_q.n_M on the trace, nVisc fields of faceOffset
+occa::memory o_vfaceP; // F_M.n_M + F_P.n_P after the exchange
+occa::memory o_viscFit; // transport fits, 5 per species (pair)
+occa::memory o_condFit;
+occa::memory o_diffFit;
+oogs_t *gshVisc = nullptr;
+
 occa::kernel primitivesKernel;
 occa::kernel conservedKernel;
 occa::kernel traceGatherKernel;
@@ -88,6 +110,11 @@ occa::kernel surfaceFluxKernel;
 occa::kernel surfaceLiftKernel;
 occa::kernel ssprkStageKernel;
 occa::kernel waveSpeedKernel;
+occa::kernel transportKernel;
+occa::kernel viscGradKernel;
+occa::kernel viscFluxKernel;
+occa::kernel viscTraceGatherKernel;
+occa::kernel viscDivKernel;
 
 bool buildKernelCalled = false;
 bool setupCalled = false;
@@ -159,6 +186,27 @@ void readOptions()
   opt.positivityLimiter = parFlag("positivitylimiter", false);
   opt.artificialViscosity = parFlag("artificialviscosity", false);
   opt.fullInterfaceLLF = parFlag("fullinterfacellf", false);
+
+  const auto transport = parString("transport", isPerfectGas ? "constant" : "fits");
+  nekrsCheck(transport != "constant" && transport != "fits",
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "[DGCOMP] transport = %s is not supported (constant | fits)\n",
+             transport.c_str());
+  opt.transport = (transport == "fits") ? 1 : 0;
+  platform->par->extract("dgcomp", "mu", opt.mu);
+  platform->par->extract("dgcomp", "prandtl", opt.prandtl);
+  platform->par->extract("dgcomp", "lewis", opt.lewis);
+  nekrsCheck(opt.viscous && opt.transport == 0 && !(opt.mu > 0),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "[DGCOMP] viscous = yes with transport = constant needs mu > 0");
+  nekrsCheck(opt.viscous && opt.transport == 0 && (!(opt.prandtl > 0) || !(opt.lewis > 0)),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "[DGCOMP] prandtl and lewis must be > 0");
 
   // keys missing from the par file keep the defaults above
   platform->par->extract("dgcomp", "dtchem", opt.dtChem);
@@ -319,7 +367,60 @@ void computeRhs(double time)
                     o_faceFlux);
   surfaceLiftKernel(mesh->Nelements, fieldOffset, faceOffset, o_faceFlux, o_rhs);
 
-  // TODO(M2): BR1 viscous terms, transport from the Cantera host bridge
+  if (opt.viscous) {
+    // transport properties (compvar.f vis1, cond1, diff1)
+    transportKernel(mesh->Nlocal,
+                    fieldOffset,
+                    opt.transport,
+                    opt.mu,
+                    opt.prandtl,
+                    opt.lewis,
+                    o_aa,
+                    o_mw,
+                    o_viscFit,
+                    o_condFit,
+                    o_diffFit,
+                    o_primv,
+                    o_trans);
+
+    // BR1 gradients (liftGrad), from the primitive trace exchanged above
+    for (int g = 0; g < nVisc; g++) {
+      viscGradKernel(mesh->Nelements,
+                     fieldOffset,
+                     faceOffset,
+                     g,
+                     mesh->o_vgeo,
+                     mesh->o_sgeo,
+                     mesh->o_D,
+                     o_mw,
+                     o_primv,
+                     o_faceM,
+                     o_faceP,
+                     o_grad);
+    }
+
+    // viscous fluxes (viscous.f) and their central face average
+    viscFluxKernel(mesh->Nlocal, fieldOffset, o_bi, o_mw, o_primv, o_trans, o_grad, o_vflux);
+    viscTraceGatherKernel(mesh->Nelements, fieldOffset, faceOffset, mesh->o_vmapM, mesh->o_sgeo, o_vflux, o_vfaceM);
+    o_vfaceP.copyFrom(o_vfaceM, nVisc * faceOffset);
+    oogs::startFinish(o_vfaceP, nVisc, faceOffset, ogsDfloat, ogsAdd, gshVisc);
+
+    // weak divergence (divQ_weak), added to o_rhs
+    for (int q = 0; q < nVisc; q++) {
+      viscDivKernel(mesh->Nelements,
+                    fieldOffset,
+                    faceOffset,
+                    q,
+                    mesh->o_vgeo,
+                    mesh->o_sgeo,
+                    mesh->o_D,
+                    o_vflux,
+                    o_vfaceM,
+                    o_vfaceP,
+                    o_rhs);
+    }
+  }
+
   // TODO(M4): unsplit chemistry source when reacting && !splitChemistry
 }
 
@@ -379,8 +480,10 @@ void dgComp::buildKernel(occa::properties kernelInfo)
   nEq = 4 + nspec;
   nPrim = prim::Y0 + nspec;
   nTrace = nEq + nPrim;
+  nVisc = 4 + (nspec > 1 ? nspec : 0);
 
   kernelInfo["defines/p_Nspec"] = nspec;
+  kernelInfo["defines/p_Nvisc"] = nVisc;
   kernelInfo["defines/p_Npa"] = npa;
   kernelInfo["defines/p_Neq"] = nEq;
   kernelInfo["defines/p_Nprim"] = nPrim;
@@ -423,6 +526,11 @@ void dgComp::buildKernel(occa::properties kernelInfo)
   surfaceLiftKernel = buildKernel("dgSurfaceLiftHex3D");
   ssprkStageKernel = buildKernel("dgSSPRKStage");
   waveSpeedKernel = buildKernel("dgWaveSpeed");
+  transportKernel = buildKernel("dgTransport");
+  viscGradKernel = buildKernel("dgViscGradHex3D");
+  viscFluxKernel = buildKernel("dgViscFlux");
+  viscTraceGatherKernel = buildKernel("dgViscTraceGather");
+  viscDivKernel = buildKernel("dgViscDivHex3D");
 }
 
 void dgComp::setup()
@@ -480,12 +588,8 @@ void setupImpl(const dgComp::thermo_t &th)
              EXIT_FAILURE,
              "%s\n",
              "dgComp: volumeFlux = ec is not implemented yet, use kep");
-  if (opt.viscous && platform->comm.mpiRank() == 0) {
-    printf("dgComp: WARNING viscous = yes but viscous terms are not implemented yet (M2), running inviscid\n");
-  }
-
-  // No boundary states yet: the interface kernel treats every face as an
-  // interior (or periodic) one.
+  // No boundary states yet: the interface kernels (inviscid and BR1) treat
+  // every face as an interior (or periodic) one.
   {
     int nBoundaryFaces = 0;
     for (dlong f = 0; f < mesh->Nelements * mesh->Nfaces; f++) {
@@ -542,6 +646,49 @@ void setupImpl(const dgComp::thermo_t &th)
                         NULL,
                         OOGS_AUTO);
 
+  // BR1 viscous terms. The gradient lift reuses the primitive trace in
+  // o_faceM/o_faceP; the central viscous flux needs its own exchange of
+  // F_q.n, one field per row.
+  {
+    // fit arrays are kernel arguments in either transport mode
+    std::vector<dfloat> viscFit(5 * nspec, 0.0), condFit(5 * nspec, 0.0), diffFit(5 * nspec * nspec, 0.0);
+    if (opt.viscous && opt.transport == 1) {
+      // exportTransport.py: Cantera MixTransport fits, ascending powers of
+      // ln T, species in the same order as mw.dat (diff.dat: full matrix)
+      viscFit = readList("./visc.dat", 5 * nspec);
+      condFit = readList("./cond.dat", 5 * nspec);
+      diffFit = readList("./diff.dat", 5 * nspec * nspec);
+    }
+    o_viscFit = platform->device.malloc<dfloat>(viscFit.size());
+    o_viscFit.copyFrom(viscFit.data());
+    o_condFit = platform->device.malloc<dfloat>(condFit.size());
+    o_condFit.copyFrom(condFit.data());
+    o_diffFit = platform->device.malloc<dfloat>(diffFit.size());
+    o_diffFit.copyFrom(diffFit.data());
+  }
+  if (opt.viscous) {
+    o_trans = platform->device.malloc<dfloat>((2 + nspec) * fieldOffset);
+    o_grad = platform->device.malloc<dfloat>(3 * nVisc * fieldOffset);
+    o_vflux = platform->device.malloc<dfloat>(3 * nVisc * fieldOffset);
+    o_vfaceM = platform->device.malloc<dfloat>(nVisc * faceOffset);
+    o_vfaceP = platform->device.malloc<dfloat>(nVisc * faceOffset);
+    platform->linAlg->fill((2 + nspec) * fieldOffset, 0.0, o_trans);
+    platform->linAlg->fill(3 * nVisc * fieldOffset, 0.0, o_grad);
+    platform->linAlg->fill(3 * nVisc * fieldOffset, 0.0, o_vflux);
+    platform->linAlg->fill(nVisc * faceOffset, 0.0, o_vfaceM);
+
+    gshVisc = oogs::setup(Ntr,
+                          mesh->globalFaceIds,
+                          nVisc,
+                          faceOffset,
+                          ogsDfloat,
+                          platform->comm.mpiComm(),
+                          1,
+                          platform->device.occaDevice(),
+                          NULL,
+                          OOGS_AUTO);
+  }
+
   if (platform->comm.mpiRank() == 0) {
     if (isPerfectGas) {
       printf("dgComp: thermo=perfectGas gamma=%g R=%g J/(kg K)\n", gammaGas, Rgas);
@@ -566,6 +713,17 @@ void setupImpl(const dgComp::thermo_t &th)
            opt.reacting,
            opt.splitChemistry,
            opt.dtChem);
+    if (opt.viscous) {
+      if (opt.transport == 0) {
+        printf("dgComp: BR1 viscous, transport=constant mu=%g prandtl=%g lewis=%g\n",
+               opt.mu,
+               opt.prandtl,
+               opt.lewis);
+      } else {
+        printf("dgComp: BR1 viscous, transport=fits (Cantera mixture-averaged; visc.dat, cond.dat, "
+               "diff.dat)\n");
+      }
+    }
     printf("dgComp: positivityLimiter=%d artificialViscosity=%d avCstar=%g avCmax=%g avP=%g\n",
            opt.positivityLimiter,
            opt.artificialViscosity,

@@ -9,12 +9,12 @@ This is the nekRS port of the CompNek5000 case
 
 It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 
-**Status: M1, inviscid.**
-- The inviscid RHS is in: KEP volume flux, and the LLF, HLL, HLLC or blended HLLC/HLL interface flux (`[DGCOMP] riemannSolver`). Not compiled or run yet.
-- Viscous terms (BR1 and the Cantera transport properties, M2) are not implemented, so `viscous = no` for now.
-  - The run is therefore inviscid. It does **not** reproduce the viscous Nek5000 reference (urms decays to 58.7 m/s at 4.5 tau0); only numerical dissipation removes energy here.
-  - To compare now, run CompNek5000 with `ifviscous = .false.` and the same flux settings (`ifVolEC = .false.`, `uparam(5)` = `riemannSolver`, `ifIntLLFfull` = `fullInterfaceLLF`, same dt). Or compare the step-0 RHS, see `doc/dg/IMPLEMENTATION.md` §5.
-- No CFL control yet: dt is fixed from the par file.
+**Status: inviscid solver runs and matches CompNek5000; viscous (M2) is written but not compiled or run yet.**
+- Inviscid RHS: KEP volume flux, and the LLF, HLL, HLLC or blended HLLC/HLL interface flux (`[DGCOMP] riemannSolver`).
+- Viscous RHS (`viscous = yes`): BR1, as in CompNek5000 `liftGrad` / `divQ_weak` / `viscous.f`, with transport from Cantera's mixture-averaged model (see [Transport](#transport)).
+  - The Nek5000 reference to compare with: urms decays to 58.7 m/s at 4.5 tau0.
+  - For the inviscid comparison runs set `viscous = no`, and run CompNek5000 with `ifviscous = .false.` and the same flux settings (`ifVolEC = .false.`, `uparam(5)` = `riemannSolver`, `ifIntLLFfull` = `fullInterfaceLLF`, same dt). Inviscid KEP is not entropy stable, so both codes eventually go NaN on this case. With HLLC and dt = 1e-10 the two `stat_ref.dat` files agree to 12-13 digits until CompNek5000 goes NaN at 3.99e-8 s; nekRS lasts to 4.51e-8 s (round-off decides the exact step).
+- No CFL control yet: dt is fixed from the par file. dt = 1.5e-10 s is below both the acoustic (~3.5e-10 s) and the viscous (~1.7e-9 s) limit.
 - See `doc/dg/IMPLEMENTATION.md` for which Fortran routines are ported.
 
 ## Parameters
@@ -53,7 +53,30 @@ Definitions, as in `base.usr`:
 - tau0 = lambda/urms, K0, c0 = <a>, gamma0 = <gamma>, Mt0 = sqrt(3) urms / c0 and Tscale = (gamma0 - 1) <T> Mt0^2, all at step 0.
 - m and e are the integrals of rho and rho E.
 
-Until the transport properties arrive (M2) the viscosity is not computed, so Re_lambda uses the constant `mu0`. The par file sets the Cantera value for air at 300 K and 1e5 Pa, which is what the CompNek5000 run reports at step 0. The other columns do not depend on mu.
+Re_lambda uses the constant `[CASEDATA] mu0`, not the solver's viscosity. The par file sets the Cantera value for air at 300 K and 1e5 Pa, which is what the CompNek5000 run reports at step 0. The other columns do not depend on mu.
+
+### Transport
+
+`[DGCOMP] transport` picks how mu, lambda and rho D_k are computed when `viscous = yes`:
+
+| `transport` | model | needs |
+|---|---|---|
+| `fits` (default with `nasa`, this case) | Cantera mixture-averaged (`MixTransport`, not CK mode), evaluated on the GPU from Cantera's own polynomial fits: Wilke viscosity, averaged conductivity, mixture-averaged D_k | `visc.dat`, `cond.dat`, `diff.dat` |
+| `constant` (default with `perfectGas`) | mu = `mu`, lambda = mu cp(T) / `prandtl`, rho D_k = mu / (`prandtl` `lewis`) | `mu` (`prandtl` 0.72, `lewis` 1.0 by default) |
+
+With `fits` the plugin reproduces what Cantera's `gas.viscosity`, `gas.thermal_conductivity` and `gas.mix_diff_coeffs` return for the same mechanism, to round-off, without linking Cantera. Write the files once on any machine with Cantera:
+
+```bash
+python exportTransport.py air1.yaml
+```
+
+This writes `visc.dat`, `cond.dat`, `diff.dat` and `mw.dat` in the mechanism's species order, and prints that order. It must match `aa.dat`, `h0.dat`, `s0.dat` and `[DGCOMP] species`. To check the kernel formulas against Cantera at one state:
+
+```bash
+python exportTransport.py air1.yaml --check --T 300 --p 1e5 --Y O2:0.23,N2:0.77
+```
+
+The relative differences printed should be at round-off level.
 
 ### Thermo model
 
@@ -72,14 +95,16 @@ The `.dat` files are only needed with `thermo = nasa`.
 |---|---|
 | `hit_modes.dat` | `compHIT_direct_Re_lamda_100/LLF/hit_modes.dat` (same file for LLF and HLLC) |
 | `aa.dat`, `h0.dat`, `s0.dat` | thermo refit files the Fortran `usrdat` reads (air1.yaml, O2 then N2) |
+| `visc.dat`, `cond.dat`, `diff.dat` | not from the case: written by `exportTransport.py air1.yaml` (see [Transport](#transport)); only with `viscous = yes`, `transport = fits` |
 | mesh | `dgCompHIT.re2`, see [Mesh](#mesh) |
+
 `mw.dat` is already in this directory: molar masses in g/mol, one per line, O2 then N2 (31.998, 28.014, the values Cantera's `getmolecularweights` returns). Its order must match `aa.dat`, `h0.dat` and `s0.dat`. To check the order, or to write it for another mechanism:
 
 ```bash
 python -c "import cantera as ct; g = ct.Solution('air1.yaml'); print(g.species_names); print(*g.molecular_weights, sep='\n')"
 ```
 
-The CompNek5000 run also prints the order at startup (`species       mol wt`). `mw.dat` is temporary. It goes away once the Cantera host bridge (M2) supplies the molar masses. No `.yaml` file is read at run time.
+The CompNek5000 run also prints the order at startup (`species       mol wt`). `exportTransport.py` rewrites `mw.dat` with the same values. No `.yaml` file is read at run time.
 
 ## Mesh
 

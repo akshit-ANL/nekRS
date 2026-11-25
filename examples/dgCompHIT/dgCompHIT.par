@@ -28,7 +28,9 @@ species = O2, N2           # output names Y_O2, Y_N2; same order as aa.dat/mw.da
 npa = 5
 riemannSolver = llf        # llf | hll | hllc | hllcBlend (userparam05 = 0..3); the HLLC reference case uses hllc
 volumeFlux = kep
-viscous = no               # set to yes in M2 (BR1 + Cantera transport)
+viscous = yes              # BR1; no for the inviscid comparison runs
+transport = fits           # Cantera mixture-averaged fits: visc.dat, cond.dat, diff.dat (exportTransport.py)
+                           # or: transport = constant, mu = 1.862349546833299e-5, prandtl = 0.72, lewis = 1.0
 reacting = no
 splitChemistry = no
 clip = no
@@ -46,6 +48,6 @@ boxLength = 1.6467320829664873e-4   # base.usr L0 [m]
 T0 = 300.0                 # [K]
 p0 = 1.0e5                 # [Pa]
 Y0 = 0.23, 0.77            # same order as species; nasa only
-mu0 = 1.862349546833299e-5 # [Pa s] Cantera air at T0, p0; only for Re_lambda in stat.dat
+mu0 = 1.862349546833299e-5 # [Pa s] Cantera air at T0, p0; only for Re_lambda in stat.dat (not the solver's mu)
 statInterval = 1           # steps between stat.dat / stat_ref.dat rows (base.usr sfreq)
 consInterval = 10          # steps between cons.dat rows (base.usr cfreq)

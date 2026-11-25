@@ -25,7 +25,7 @@ Last updated: 2026-11-25
 
 ## 1. Implemented
 
-None of this code has been compiled yet.
+The inviscid solver (T-01 to T-19) builds and runs: the inviscid HLLC compHIT run matches CompNek5000 to 12-13 digits (B-05). T-31 and T-50 (viscous, transport) have not been compiled yet.
 
 | ID | Item | M | Status | Verified on | Commit | Notes |
 |---|---|---|---|---|---|---|
@@ -46,8 +46,10 @@ None of this code has been compiled yet.
 | T-47 | `[DGCOMP]` section in `doc/parHelp.txt`; `mw.dat` (O2, N2) shipped with `dgCompHIT` | - | done | - | c336b968 | |
 | T-30 | HIT statistics in `dgCompHIT.udf`: `stat.dat` (`calc_stat`), `stat_ref.dat` (`hit_ref_stat`), `cons.dat` (`check_cons`), same columns and formats as `base.usr`; `[CASEDATA]` mu0, statInterval, consInterval | M2 | done | - | fd08f499 | Re_lambda uses the constant `mu0` until the transport properties (T-32) exist |
 | T-48 | `doc/dg/IMPLEMENTATION.md`: plugin layout, call flow, every `src/*.f` and `base.usr` routine mapped to its nekRS function or kernel with status | - | done | - | 6eb19e02 | Keep it updated with each port |
-| T-18 | KEP flux-differencing volume kernel (`advect_volInt`, `getFlux_KEP`): `dgVolumeRhsHex3D` | M1 | done | - | - | Shared-memory primitives, one thread per (i,j) column. EC split off to T-49 |
-| T-19 | Inviscid surface flux and lift (`advect_interface`, `eval_lmf`, `riemann.f`): `dgSurfaceFluxHex3D` (LLF partial/full, HLL, HLLC, HLLC/HLL blend) and `dgSurfaceLiftHex3D` | M1 | done | - | - | `[DGCOMP] riemannSolver`, `blendSw0/blendSw1/blendSwRho`. Fully periodic meshes only: setup aborts on boundary faces until T-36 |
+| T-18 | KEP flux-differencing volume kernel (`advect_volInt`, `getFlux_KEP`): `dgVolumeRhsHex3D` | M1 | done | - | bd27067e | Shared-memory primitives, one thread per (i,j) column. EC split off to T-49. Matches CompNek5000 (B-05) |
+| T-19 | Inviscid surface flux and lift (`advect_interface`, `eval_lmf`, `riemann.f`): `dgSurfaceFluxHex3D` (LLF partial/full, HLL, HLLC, HLLC/HLL blend) and `dgSurfaceLiftHex3D` | M1 | done | - | bd27067e | `[DGCOMP] riemannSolver`, `blendSw0/blendSw1/blendSwRho`. Fully periodic meshes only: setup aborts on boundary faces until T-36. HLLC matches CompNek5000 (B-05) |
+| T-31 | BR1 viscous terms (`liftGrad`, `divQ_weak`, `viscous.f` `eval_visc_U/EY`): `dgViscGradHex3D` (strong derivative plus central lift), `dgViscFlux` (tau, Fick + correction, u.tau + lambda grad T + sum h_k J_k), `dgViscTraceGather`, normal-flux oogs exchange, `dgViscDivHex3D` (weak divergence, central flux) | M2 | done | - | - | `[DGCOMP] viscous = yes`. Gradients of u, v, w, T and, for nspec > 1, X_k. Uses full metrics, unlike the Fortran `dgGrad_weak` (B-04). Not compiled yet |
+| T-50 | Fit-based transport on the GPU: `dgTransport` kernel, Cantera `MixTransport` formulas (Wilke mu, averaged lambda, mixture-averaged D_k) from Cantera's own polynomial fits; `transport = constant` (mu, prandtl, lewis) alternative; `examples/dgCompHIT/exportTransport.py` writes `visc/cond/diff/mw.dat` and checks the formulas against Cantera | M2 | done | - | - | No Cantera at run time. Replaces T-32 and T-41 for transport. Not compiled yet; needs the `.dat` files from a machine with Cantera |
 
 ## 2. Pending (current: M0 and M1)
 
@@ -71,8 +73,7 @@ None of this code has been compiled yet.
 
 | ID | Item | M | Status | Notes |
 |---|---|---|---|---|
-| T-31 | BR1 viscous kernels (gradient lift, weak divergence) | M2 | todo | |
-| T-32 | `dgCantera` host class (mu, lambda, D_k), Phase A | M2 | todo | |
+| T-32 | `dgCantera` host class (mu, lambda, D_k), Phase A | M2 | todo | Optional now: T-50 evaluates transport from Cantera's fits on the GPU. Still the route for chemistry (T-39) |
 | T-33 | `ENABLE_CANTERA` / `CANTERA_DIR` in CMake, with stubs when Cantera is absent | M2 | todo | |
 | T-34 | Molar masses and thermo fits from Cantera instead of the `.dat` files | M2 | todo | |
 | T-35 | Validate compHIT, LLF and HLLC, against `stat_ref.dat` and Bielawski Fig. A.15 | M2 | todo | |
@@ -81,7 +82,7 @@ None of this code has been compiled yet.
 | T-38 | Entropy viscosity (`eval_enmu`, `eval_enhe`) | M3 | todo | Uses avCstar, avCmax, avP |
 | T-39 | Strang-split chemistry (`integrate_chem`), host Cantera | M4 | todo | Uses dtChem |
 | T-40 | Unsplit chemistry source (`compf.f`) | M4 | todo | |
-| T-41 | GPU transport (Phase B) | M5 | todo | |
+| T-41 | GPU transport (Phase B) | M5 | done | Done early as T-50 |
 | T-42 | GPU kinetics, generated OKL (Phase C) | M5 | todo | Ask the nekRS developers about existing code first |
 | T-43 | Performance: shared-memory volume flux, overlapped exchange, fused kernels | M6 | todo | |
 | T-44 | Scaling runs on Polaris and Aurora | M6 | todo | |
@@ -106,7 +107,9 @@ Stage is one of `configure`, `build`, `udf-compile`, `kernel-jit` or `run`.
 |---|---|---|---|---|---|---|
 | B-01 | 2026-11-23 | - | - | Possible bug in the Fortran `fluxLF.f::eval_lmf`: `k` is incremented but never set to 0 first. The port initialises it. If results differ from Nek5000, check this first. | closed | Not a bug: `k = 0` is set at `fluxLF.f:21`. `dgSurfaceFluxHex3D` takes the max of a+\|u.n\| over both sides pointwise |
 | B-02 | 2026-11-24 | - | run | No checkpoint written with `checkpointControl = simulationTime`, `checkpointInterval = 5e-8` (not even at the last step). `parseGeneral.hpp` stored the interval with `std::to_string` ("%f"), giving "0.000000", so the driver disabled output. Affects any interval below 1e-6. | done | `to_string_f` in `parseGeneral.hpp`; needs a nekRS rebuild |
-| B-03 | 2026-11-25 | - | run | Not a bug. In the compHIT outputs p stays at 1 bar, and u is about 2x the Nek5000 value at late times. Both happen because the volume and surface RHS are stubs (T-18, T-19), so the field stays frozen at the IC: urms stays at 120.5 while Nek5000 decays to 58.7 at 4.5 tau0. The IC matches `base.usr` (`fourierVelocity` = `hit_eval`). | explained | T-18/T-19 are now in (inviscid). Rerun after rebuilding; the viscous decay also needs T-31/T-32 |
+| B-03 | 2026-11-25 | - | run | Not a bug. In the compHIT outputs p stays at 1 bar, and u is about 2x the Nek5000 value at late times. Both happen because the volume and surface RHS are stubs (T-18, T-19), so the field stays frozen at the IC: urms stays at 120.5 while Nek5000 decays to 58.7 at 4.5 tau0. The IC matches `base.usr` (`fourierVelocity` = `hit_eval`). | explained | T-18/T-19 are now in (inviscid). Rerun after rebuilding; the viscous decay also needs T-31/T-50 |
+| B-04 | 2026-11-25 | - | - | Fortran `dgdiv.f::dgGrad_weak` applies the metrics of node i and the quadrature-weight ratio of the derivative direction only. That is exact on an axis-aligned affine mesh (the HIT box) and inconsistent on curved or skewed meshes. `dgViscGradHex3D` uses the full metrics at every node, so the two agree on compHIT and differ elsewhere. | open | Keep the nekRS form; report upstream if a curved-mesh case disagrees |
+| B-05 | 2026-11-25 | - | run | Inviscid HLLC compHIT, dt = 1e-10: nekRS and CompNek5000 `stat_ref.dat` agree to 12-13 digits at every step up to 3.98e-8 s (K/K0 0.955345302345224 vs ...226). CompNek5000 goes NaN at 3.99e-8 s with no growth before it; nekRS continues smoothly to 4.48e-8 s, then omega2 jumps at 4.49e-8 and 4.50e-8 and it goes NaN at 4.51e-8 s. Primitives (clip off in both, Newton from 500 K, tol 1e-8, 1000 iterations) and `flux_hllc` are the same, so the different crash times are round-off reaching an under-resolved node (inviscid KEP is not entropy stable), not a porting difference. | explained | Validates T-18/T-19. A min(rho, p, T) / max Mach diagnostic would show where each code fails |
 
 ### Bug report template
 
