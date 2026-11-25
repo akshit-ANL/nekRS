@@ -12,7 +12,11 @@ It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 **Status: M0 scaffold.**
 - The volume and surface RHS kernels are still stubs that return zero.
 - A run should therefore leave the initial field unchanged.
+  - Every checkpoint shows the same field: p = p0 = 1 bar everywhere, T = T0, and urms = 120.5 m/s.
+  - This is expected. Compared with the Nek5000 run, the velocity looks too high (about 2x at the end time, where Nek5000 has decayed to urms = 58.7 m/s). Nek5000's pressure and temperature fluctuations also have no counterpart here.
+  - Only step 0 can be compared with Nek5000 until the fluxes land.
 - This exercises setup, the EOS/Newton primitives, the face exchange, SSPRK3 and checkpointing, not the physics.
+- See `doc/dg/IMPLEMENTATION.md` for which Fortran routines are ported.
 - Viscous terms (M2) are not implemented, so `viscous = no` for now.
 
 ## Parameters

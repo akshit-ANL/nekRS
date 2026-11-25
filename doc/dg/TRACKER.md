@@ -1,6 +1,6 @@
 # dgComp port: task tracker
 
-The plan and design live in [ROADMAP.md](ROADMAP.md). This file tracks the status of the work.
+The plan and design live in [ROADMAP.md](ROADMAP.md). The Fortran-routine-to-nekRS map is in [IMPLEMENTATION.md](IMPLEMENTATION.md). This file tracks the status of the work.
 
 ## How to edit
 
@@ -8,7 +8,7 @@ The plan and design live in [ROADMAP.md](ROADMAP.md). This file tracks the statu
   - `T-nn` work item
   - `C-nn` example or validation case
   - `B-nn` bug, or a build or run failure
-- **When something finishes:** move its row from *Pending* to *Implemented*. Keep the ID and fill in the commit.
+- **When something finishes:** move its row from *Pending* to *Implemented*. Keep the ID and fill in the commit. If it ports a Fortran routine, update that routine's row in [IMPLEMENTATION.md](IMPLEMENTATION.md) too.
 - **Status values:**
   - `todo`: not started
   - `wip`: in progress
@@ -19,7 +19,7 @@ The plan and design live in [ROADMAP.md](ROADMAP.md). This file tracks the statu
 - **Machines:** `polaris` (CUDA), `aurora` (DPCPP), `local`.
 - **Bug reports:** use the template at the end of this file.
 
-Last updated: 2026-11-24
+Last updated: 2026-11-25
 
 ---
 
@@ -44,7 +44,8 @@ None of this code has been compiled yet.
 | T-45 | Single-component perfect gas as the default: `[DGCOMP] thermo = perfectGas` (gamma, gasConstant) or `nasa`; `p_perfectGas` kernel branch; `dgComp::setup()` with no arguments; Y optional when nspec = 1 | M1 | done | - | 9953dc2a | DG solver first, multi-species second. nspec = 1 skips the Y output |
 | T-46 | `dgCompHIT.udf`: direct `par->extract` calls in `UDF_Setup0`, checks in `checkCaseData()`; runs with either thermo | M2 | done | - | 9953dc2a | Same pattern as `mv_cyl` |
 | T-47 | `[DGCOMP]` section in `doc/parHelp.txt`; `mw.dat` (O2, N2) shipped with `dgCompHIT` | - | done | - | c336b968 | |
-| T-30 | HIT statistics in `dgCompHIT.udf`: `stat.dat` (`calc_stat`), `stat_ref.dat` (`hit_ref_stat`), `cons.dat` (`check_cons`), same columns and formats as `base.usr`; `[CASEDATA]` mu0, statInterval, consInterval | M2 | done | - | - | Re_lambda uses the constant `mu0` until the transport properties (T-32) exist |
+| T-30 | HIT statistics in `dgCompHIT.udf`: `stat.dat` (`calc_stat`), `stat_ref.dat` (`hit_ref_stat`), `cons.dat` (`check_cons`), same columns and formats as `base.usr`; `[CASEDATA]` mu0, statInterval, consInterval | M2 | done | - | fd08f499 | Re_lambda uses the constant `mu0` until the transport properties (T-32) exist |
+| T-48 | `doc/dg/IMPLEMENTATION.md`: plugin layout, call flow, every `src/*.f` and `base.usr` routine mapped to its nekRS function or kernel with status | - | done | - | - | Keep it updated with each port |
 
 ## 2. Pending (current: M0 and M1)
 
@@ -104,6 +105,7 @@ Stage is one of `configure`, `build`, `udf-compile`, `kernel-jit` or `run`.
 |---|---|---|---|---|---|---|
 | B-01 | 2026-11-23 | - | - | Possible bug in the Fortran `fluxLF.f::eval_lmf`: `k` is incremented but never set to 0 first. The port initialises it. If results differ from Nek5000, check this first. | watch | - |
 | B-02 | 2026-11-24 | - | run | No checkpoint written with `checkpointControl = simulationTime`, `checkpointInterval = 5e-8` (not even at the last step). `parseGeneral.hpp` stored the interval with `std::to_string` ("%f"), giving "0.000000", so the driver disabled output. Affects any interval below 1e-6. | done | `to_string_f` in `parseGeneral.hpp`; needs a nekRS rebuild |
+| B-03 | 2026-11-25 | - | run | Not a bug. In the compHIT outputs p stays at 1 bar, and u is about 2x the Nek5000 value at late times. Both happen because the volume and surface RHS are stubs (T-18, T-19), so the field stays frozen at the IC: urms stays at 120.5 while Nek5000 decays to 58.7 at 4.5 tau0. The IC matches `base.usr` (`fourierVelocity` = `hit_eval`). | explained | resolves with T-18/T-19 |
 
 ### Bug report template
 
