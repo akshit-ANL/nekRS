@@ -340,6 +340,25 @@ void checkReady(const char *caller)
              caller);
 }
 
+// transport properties mu, lambda, rho D_k from o_primv into o_trans
+// (compvar.f vis1, cond1, diff1)
+void evaluateTransport()
+{
+  transportKernel(mesh->Nlocal,
+                  fieldOffset,
+                  opt.transport,
+                  opt.mu,
+                  opt.prandtl,
+                  opt.lewis,
+                  o_aa,
+                  o_mw,
+                  o_viscFit,
+                  o_condFit,
+                  o_diffFit,
+                  o_primv,
+                  o_trans);
+}
+
 // dU/dt = volume + surface terms (advect.f::advect, inviscid part).
 // Assumes o_primv is current for o_Ucons.
 void computeRhs(double time)
@@ -368,20 +387,7 @@ void computeRhs(double time)
   surfaceLiftKernel(mesh->Nelements, fieldOffset, faceOffset, o_faceFlux, o_rhs);
 
   if (opt.viscous) {
-    // transport properties (compvar.f vis1, cond1, diff1)
-    transportKernel(mesh->Nlocal,
-                    fieldOffset,
-                    opt.transport,
-                    opt.mu,
-                    opt.prandtl,
-                    opt.lewis,
-                    o_aa,
-                    o_mw,
-                    o_viscFit,
-                    o_condFit,
-                    o_diffFit,
-                    o_primv,
-                    o_trans);
+    evaluateTransport();
 
     // BR1 gradients (liftGrad), from the primitive trace exchanged above
     for (int g = 0; g < nVisc; g++) {
@@ -818,6 +824,25 @@ void dgComp::step(double time, dfloat dt)
   // TODO(M4): Strang-split chemistry when reacting && splitChemistry
 
   copyToFluid();
+}
+
+bool dgComp::viscous()
+{
+  return opt.viscous;
+}
+
+occa::memory dgComp::computeTransport()
+{
+  checkReady("computeTransport");
+  nekrsCheck(!opt.viscous,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp::computeTransport needs viscous = yes");
+  // Fortran recomputes vis1 from the final state after each step
+  // (rungeKutta.f eval_dependent_vars); the RHS only sees stage states.
+  evaluateTransport();
+  return o_trans;
 }
 
 dfloat dgComp::maxWaveSpeed()

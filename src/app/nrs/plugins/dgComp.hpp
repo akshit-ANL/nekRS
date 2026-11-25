@@ -133,6 +133,15 @@ void computePrimitives();
 // Largest |u| + a on this mesh, reduced over all ranks.
 dfloat maxWaveSpeed();
 
+// [DGCOMP] viscous
+bool viscous();
+
+// Evaluate transport from the current primitives and return it: mu, lambda,
+// rho D_k as (2 + nspec) fields of fieldOffset. Needs viscous = yes. Call
+// after step() or setSolution() to get the end-of-step values (CompNek5000
+// vis1, cond1, diff1); the buffer is overwritten by the next step.
+occa::memory computeTransport();
+
 // Register the primitives as checkpoint fields. velocity, pressure and
 // temperature always keep those names. Density and the mass fractions are
 // named only with checkpointEngine = adios, because the nek (.fld) writer

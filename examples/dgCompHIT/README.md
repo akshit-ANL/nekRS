@@ -9,12 +9,13 @@ This is the nekRS port of the CompNek5000 case
 
 It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 
-**Status: inviscid solver runs and matches CompNek5000; viscous (M2) is written but not compiled or run yet.**
+**Status: inviscid and viscous solvers run and match CompNek5000.**
 - Inviscid RHS: KEP volume flux, and the LLF, HLL, HLLC or blended HLLC/HLL interface flux (`[DGCOMP] riemannSolver`).
 - Viscous RHS (`viscous = yes`): BR1, as in CompNek5000 `liftGrad` / `divQ_weak` / `viscous.f`, with transport from Cantera's mixture-averaged model (see [Transport](#transport)).
-  - The Nek5000 reference to compare with: urms decays to 58.7 m/s at 4.5 tau0.
+  - The Nek5000 reference to compare with: urms decays to 58.7 m/s at 4.5 tau0. With HLLC and dt = 1e-10 the nekRS `stat_ref.dat` agrees with the CompNek5000 `HLLC` run to about 1e-7 relative over the whole run.
+  - To plot nekRS against CompNek5000 and the Johnson et al. reference, use `plot_hit_comparison.py` in the CompNek5000 case directory with `--case LABEL=PATH` per run.
   - For the inviscid comparison runs set `viscous = no`, and run CompNek5000 with `ifviscous = .false.` and the same flux settings (`ifVolEC = .false.`, `uparam(5)` = `riemannSolver`, `ifIntLLFfull` = `fullInterfaceLLF`, same dt). Inviscid KEP is not entropy stable, so both codes eventually go NaN on this case. With HLLC and dt = 1e-10 the two `stat_ref.dat` files agree to 12-13 digits until CompNek5000 goes NaN at 3.99e-8 s; nekRS lasts to 4.51e-8 s (round-off decides the exact step).
-- No CFL control yet: dt is fixed from the par file. dt = 1.5e-10 s is below both the acoustic (~3.5e-10 s) and the viscous (~1.7e-9 s) limit.
+- No CFL control yet: dt is fixed from the par file. nekRS rejects dt < 1e-10 (`nekrs::dt`). dt = 1.5e-10 s is below both the acoustic (~3.5e-10 s) and the viscous (~1.7e-9 s) limit.
 - See `doc/dg/IMPLEMENTATION.md` for which Fortran routines are ported.
 
 ## Parameters
@@ -28,7 +29,7 @@ The par file has two user sections:
 | `boxLength` | box length L [m] (`base.usr` L0) | required |
 | `T0`, `p0` | initial temperature [K] and pressure [Pa] | required |
 | `Y0` | initial mass fractions, same order as `species` | required for nspec > 1 |
-| `mu0` | dynamic viscosity [Pa s], only used for Re_lambda in `stat.dat` | 0 (Re_lambda written as 0, with a warning) |
+| `mu0` | dynamic viscosity [Pa s], used for Re_lambda in `stat.dat` only when `viscous = no` | 0 (inviscid: Re_lambda written as 0, with a warning) |
 | `statInterval` | steps between `stat.dat` / `stat_ref.dat` rows (`base.usr` sfreq) | 1 |
 | `consInterval` | steps between `cons.dat` rows (`base.usr` cfreq) | 10 |
 
@@ -48,12 +49,12 @@ The udf ports `calc_stat`, `hit_ref_stat` and `check_cons` from `base.usr`. The 
 | `cons.dat` | every `consInterval` steps, from step 1 | `time  (m0-m)/m0  (e0-e)/e0` (E13.5, 2 x E15.7) |
 
 Definitions, as in `base.usr`:
-- urms = sqrt(<\|u - <u>\|^2> / 3); lambda = sqrt(urms^2 / <(du/dx)^2>); Re_lambda = urms lambda <rho> / mu0.
+- urms = sqrt(<\|u - <u>\|^2> / 3); lambda = sqrt(urms^2 / <(du/dx)^2>); Re_lambda = urms lambda <rho> / <mu>.
 - K = 1.5 urms^2; omega2 = <\|curl u\|^2> (no factor 1/2); theta = div u, theta2 = <theta^2>; Tvar = Trms^2.
 - tau0 = lambda/urms, K0, c0 = <a>, gamma0 = <gamma>, Mt0 = sqrt(3) urms / c0 and Tscale = (gamma0 - 1) <T> Mt0^2, all at step 0.
 - m and e are the integrals of rho and rho E.
 
-Re_lambda uses the constant `[CASEDATA] mu0`, not the solver's viscosity. The par file sets the Cantera value for air at 300 K and 1e5 Pa, which is what the CompNek5000 run reports at step 0. The other columns do not depend on mu.
+With `viscous = yes`, <mu> is the volume average of the solver's viscosity at the end of the step (`dgComp::computeTransport()`), as `base.usr` does with `glsc2(bm1,vis1,n)/volvm1`. With `viscous = no` there is no transport, so the constant `[CASEDATA] mu0` stands in. The par file sets it to the Cantera value for air at 300 K and 1e5 Pa, which is what the CompNek5000 run reports at step 0. The other columns do not depend on mu.
 
 ### Transport
 

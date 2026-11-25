@@ -1293,7 +1293,10 @@ int nrs_t::lastStepLocalSession(double timeNew, int tstep, double elapsedTime)
       last = 1;
     }
   } else if (endTime >= 0) {
-    const double eps = 1e-10;
+    // Tolerance relative to the step size: a fixed 1e-10 is a whole step when
+    // dt = 1e-10, which ended the run one step early with a 2*dt final step.
+    // dt[0] is the previous step's size (DT before the first step).
+    const double eps = (dt[0] > 0) ? 1e-4 * dt[0] : 1e-10;
     last = fabs(timeNew - endTime) < eps || timeNew > endTime;
   } else {
     last = (tstep == numSteps);

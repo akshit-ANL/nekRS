@@ -19,7 +19,7 @@ static dfloat L = 0;           // boxLength, base.usr L0 [m]
 static dfloat T0 = 0;          // T0 [K]
 static dfloat p0 = 0;          // p0 [Pa]
 static std::vector<dfloat> Y0; // Y0, one mass fraction per species (nasa only)
-static dfloat mu0 = 0;         // mu0 [Pa s], only for Re_lambda in stat.dat (no transport before M2)
+static dfloat mu0 = 0;         // mu0 [Pa s], Re_lambda in stat.dat when viscous = no
 static int statInterval = 1;   // steps between stat.dat/stat_ref.dat rows (base.usr sfreq)
 static int consInterval = 10;  // steps between cons.dat rows (base.usr cfreq)
 
@@ -200,7 +200,7 @@ static void checkCaseData(int nspec)
   positive("statInterval", statInterval);
   positive("consInterval", consInterval);
   nekrsCheck(mu0 < 0, platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "[CASEDATA] mu0 is negative");
-  if (mu0 == 0 && platform->comm.mpiRank() == 0) {
+  if (mu0 == 0 && !dgComp::viscous() && platform->comm.mpiRank() == 0) {
     std::cout << "WARNING: [CASEDATA] mu0 not set, stat.dat writes Re_lambda = 0" << std::endl;
   }
 
@@ -411,8 +411,12 @@ static void hitStatistics(double time, int tstep)
   const dfloat Trms = std::sqrt(volumeAverage(workField(7)));
   const dfloat thetvar = volumeAverage(workField(8));
 
+  // <mu> from the solver's transport at this state, as base.usr
+  // (glsc2(bm1,vis1,n)/volvm1); [CASEDATA] mu0 only for inviscid runs
+  const dfloat muAvg =
+      dgComp::viscous() ? volumeAverage(dgComp::computeTransport().slice(0, Nlocal)) : mu0;
   const dfloat lambda = std::sqrt(urms * urms / dudx2);
-  const dfloat ReLambda = (mu0 > 0) ? urms * lambda * rhom / mu0 : 0;
+  const dfloat ReLambda = (muAvg > 0) ? urms * lambda * rhom / muAvg : 0;
   const dfloat kinetic = 1.5 * urms * urms;
   const dfloat Tvar = Trms * Trms;
 
@@ -434,8 +438,9 @@ static void hitStatistics(double time, int tstep)
               << "  tau0         = " << tau0 << "\n"
               << "  urms0        = " << urms << "\n"
               << "  lambda0      = " << lambda << "\n"
-              << "  Re_lambda0   = " << ReLambda << (mu0 > 0 ? "" : "  ([CASEDATA] mu0 not set)") << "\n"
-              << "  rho0         = " << rhom << "  mu0 = " << mu0 << "\n"
+              << "  Re_lambda0   = " << ReLambda << (muAvg > 0 ? "" : "  ([CASEDATA] mu0 not set)") << "\n"
+              << "  rho0         = " << rhom << "  <mu> = " << muAvg
+              << (dgComp::viscous() ? "" : "  ([CASEDATA] mu0)") << "\n"
               << "  sound_speed0 = " << c0 << "\n"
               << "  Mt0          = " << Mt0 << std::setprecision(6) << std::endl;
 

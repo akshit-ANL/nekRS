@@ -22,7 +22,7 @@ Last updated: 2026-11-25
 
 The code is short for three reasons.
 
-1. **Most of the physics is not ported yet.** The plugin is at milestone M1. The inviscid fluxes are in (KEP volume flux; LLF, HLL, HLLC and blended interface fluxes). The EC volume flux, the boundary conditions, the CFL, the viscous terms, entropy viscosity, the limiter and the chemistry are absent. That accounts for about 2.5k of the 4.3k Fortran lines; see the *Status* column in §3. The plugin grows as those land. The kernels stay in `dgComp.okl`, which can be split per topic later (for example `dgFlux.okl`, `dgViscous.okl`) without changing the API.
+1. **Most of the physics is not ported yet.** The plugin is at milestone M1. The inviscid fluxes are in (KEP volume flux; LLF, HLL, HLLC and blended interface fluxes), and so are the BR1 viscous terms with mixture-averaged transport. The EC volume flux, the boundary conditions, the CFL, entropy viscosity, the limiter and the chemistry are absent. That accounts for about 2.5k of the 4.3k Fortran lines; see the *Status* column in §3. The plugin grows as those land. The kernels stay in `dgComp.okl`, which can be split per topic later (for example `dgFlux.okl`, `dgViscous.okl`) without changing the API.
 2. **nekRS supplies what the Fortran built by hand.** These include `full2face`, `gs_op` on `dg_hndlx`, `bm1`/`jacmi`, `rxm1..tzm1`, `area`/`unx`, `dg_setup` and the `.fld` I/O. In nekRS they are `mesh->vmapM`, `oogs` on `mesh->globalFaceIds`, `mesh->o_vgeo`/`o_sgeo`, `mesh->o_LMM` and the checkpoint writer.
 3. **Small Fortran helpers become one line inside a kernel.** For example `eval_EOS_D` is `rho = p / (Ru T sum(Y/W))` in `dgConserved`, and `eval_dgeh` is `h = (rhoE + p)/rho` in `dgPrimitives`.
 
@@ -74,11 +74,12 @@ nekRS time loop (solver = none, so nekRS only advances time and writes checkpoin
    │       └─ dgPrimitives                      [compvar.f::eval_dependent_vars]
    │   └─ copyToFluid (u, p into nrs->fluid for checkpoints)
    └─ case diagnostics (stat.dat, cons.dat)     [base.usr calc_stat, check_cons]
+       └─ dgComp::computeTransport()            [rungeKutta.f eval_dependent_vars after the step: vis1 for Re_lambda]
 ```
 
 **Sign convention:** the Fortran `rkRHS` is −dU/dt. `o_rhs` in nekRS is +dU/dt. Keep this in mind when you compare dumps.
 
-**Viscous terms (BR1, T-31) and transport (T-50) are written but not compiled yet.** With `viscous = no` a nekRS run matches a Nek5000 run with `ifviscous = .false.`; the inviscid HLLC compHIT matches to 12-13 digits (TRACKER B-05). Setup aborts on any boundary face (fully periodic meshes only, until T-36).
+**Status.** With `viscous = no` a nekRS run matches a Nek5000 run with `ifviscous = .false.`; the inviscid HLLC compHIT matches to 12-13 digits (TRACKER B-05). With `viscous = yes` (BR1, T-31; fit-based transport, T-50) the viscous HLLC compHIT matches CompNek5000 to about 1e-7 relative over 4.5 τ0. The transport inside `computeRhs` is evaluated at stage states; `dgComp::computeTransport()` evaluates it at the end-of-step state, which is what the Fortran `vis1` holds when `userchk` runs. Setup aborts on any boundary face (fully periodic meshes only, until T-36).
 
 **BR1 in nekRS form.**
 - Gradient: strong derivative in each element plus the central lift ½(q_P − q_M)·n·WSJ·IJW on each face node. The exchanged q are the M+P primitives already in `o_faceP`, so there is no second exchange for the gradients.
@@ -123,7 +124,7 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
 | `eval_dependent_vars` | `dgComp::computePrimitives` → `dgPrimitives` | partial | ported: ρ, Y (with clip), W̄, u, T (Newton), γ, a, h, p. μ, λ, ρD_k are in the separate `dgTransport` kernel (T-50). Not yet: ω̇ (T-40), entropy `ss`/`si` (T-37/T-38), Mach |
-| (transport part of `eval_dependent_vars`: `viscosity`, `thermalconductivity`, `getmixdiffcoeffs`) | `dgTransport` | ported, not compiled | T-50. Mode 1 (`transport = fits`): Cantera `MixTransport` formulas from the fits in `visc/cond/diff.dat`. Mode 0 (`constant`): μ, λ = μ cp/Pr, ρD = μ/(Pr Le). Writes ρD_k, as `diff1` holds |
+| (transport part of `eval_dependent_vars`: `viscosity`, `thermalconductivity`, `getmixdiffcoeffs`) | `dgTransport` | ported | T-50. Mode 1 (`transport = fits`): Cantera `MixTransport` formulas from the fits in `visc/cond/diff.dat`. Mode 0 (`constant`): μ, λ = μ cp/Pr, ρD = μ/(Pr Le). Writes ρD_k, as `diff1` holds |
 | (Newton for T inside `eval_dependent_vars`) | `dgPrimitives`, `#if !p_perfectGas` | ported | same start (500 K), tolerance (1e-8), cap (1000). The species sum is folded into mixture coefficients before the loop, which is algebraically identical |
 | — | `dgPrimitives`, `#if p_perfectGas` | new | `thermo = perfectGas`: T = e/cv, constant γ |
 | `eval_EOS_D` | inline in `dgConserved` | ported | ρ = p W̄ / (Ru T) |
@@ -186,20 +187,20 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `dgGrad_weak` + `liftGrad` (BR1 gradient) | `dgViscGradHex3D` (`br1GradLift` for the face term) | ported, not compiled | T-31. Strong form with central lift, equivalent to weak form + lift on any mesh; full metrics (B-04) |
+| `dgGrad_weak` + `liftGrad` (BR1 gradient) | `dgViscGradHex3D` (`br1GradLift` for the face term) | ported | T-31. Strong form with central lift, equivalent to weak form + lift on any mesh; full metrics (B-04) |
 | `dgGrad_strong`, `dudxyz_strong` | — | n/a | not on the BR1 path used by compHIT |
-| `viscous` | `computeRhs` (`opt.viscous` block) | ported, not compiled | T-31 |
-| `eval_dudx` | `dgViscGradHex3D` on u, v, w (`viscVar`) | ported, not compiled | |
-| `eval_visc_U` (τ, u·τ, λ∇T) | `dgViscFlux` | ported, not compiled | τ = μ(∇u + ∇uᵀ) − ⅔μ(∇·u)I |
-| `eval_visc_EY` (species diffusion, Σ h_k J_k) | `dgViscFlux`, `#if p_Nspec > 1` | ported, not compiled | viscous species flux ρD_k (W_k/W̄)∇X_k minus Y_k times its sum over k (zero net mass flux); the energy flux adds Σ h_k of it, h_k from `bi` plus Ru T / W_k |
+| `viscous` | `computeRhs` (`opt.viscous` block) | ported | T-31 |
+| `eval_dudx` | `dgViscGradHex3D` on u, v, w (`viscVar`) | ported | |
+| `eval_visc_U` (τ, u·τ, λ∇T) | `dgViscFlux` | ported | τ = μ(∇u + ∇uᵀ) − ⅔μ(∇·u)I |
+| `eval_visc_EY` (species diffusion, Σ h_k J_k) | `dgViscFlux`, `#if p_Nspec > 1` | ported | viscous species flux ρD_k (W_k/W̄)∇X_k minus Y_k times its sum over k (zero net mass flux); the energy flux adds Σ h_k of it, h_k from `bi` plus Ru T / W_k |
 
 ### entrovisc.f — entropy viscosity
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
 | `entrovisc` | — | todo | T-38 |
-| `liftGrad` | `br1GradLift` in `dgViscGradHex3D` | ported, not compiled | T-31; reused by T-38 |
-| `divQ_weak` | `dgViscDivHex3D` (`br1DivFace` for the face term) + `dgViscTraceGather` + oogs | ported, not compiled | T-31; reused by T-38 |
+| `liftGrad` | `br1GradLift` in `dgViscGradHex3D` | ported | T-31; reused by T-38 |
+| `divQ_weak` | `dgViscDivHex3D` (`br1DivFace` for the face term) + `dgViscTraceGather` + oogs | ported | T-31; reused by T-38 |
 | `divQ_strong` | — | n/a | not on the BR1 path |
 | `eval_enmu`, `eval_enhe`, `eval_lmf_visc_reg` | — | todo | T-38; setup aborts if `artificialViscosity = yes` |
 
@@ -208,7 +209,7 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 | Fortran / C++ | nekRS | status | notes / task |
 |---|---|---|---|
 | `newIdealGasMix`, `getmolecularweights` (in `usrdat`) | `dgComp::readThermo` reads `mw.dat` | partial | `exportTransport.py` writes `mw.dat` from Cantera; T-34 for a run-time bridge |
-| `viscosity`, `thermalconductivity`, `getmixdiffcoeffs` | `dgTransport` (GPU) from the fits `exportTransport.py` writes | ported, not compiled | T-50; replaces T-32/T-41 for transport. Cantera default (non-CK) mixture-averaged model |
+| `viscosity`, `thermalconductivity`, `getmixdiffcoeffs` | `dgTransport` (GPU) from the fits `exportTransport.py` writes | ported | T-50; replaces T-32/T-41 for transport. Cantera default (non-CK) mixture-averaged model |
 | `getnetproductionrates`, `setstate_uv`, `setmassfractions` | — | todo | T-39/T-42 |
 | `cantera_stub_abort` and the other stubs | — | todo | T-33 (stubs when built without Cantera) |
 
