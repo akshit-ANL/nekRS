@@ -26,7 +26,7 @@ thermo = nasa
 nspec = 2                  # O2, N2 (air1.yaml order)
 species = O2, N2           # output names Y_O2, Y_N2; same order as aa.dat/mw.dat
 npa = 5
-riemannSolver = llf        # userparam05 = 0; hllc once M1 has it
+riemannSolver = llf        # llf | hll | hllc | hllcBlend (userparam05 = 0..3); the HLLC reference case uses hllc
 volumeFlux = kep
 viscous = no               # set to yes in M2 (BR1 + Cantera transport)
 reacting = no

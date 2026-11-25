@@ -45,7 +45,9 @@ None of this code has been compiled yet.
 | T-46 | `dgCompHIT.udf`: direct `par->extract` calls in `UDF_Setup0`, checks in `checkCaseData()`; runs with either thermo | M2 | done | - | 9953dc2a | Same pattern as `mv_cyl` |
 | T-47 | `[DGCOMP]` section in `doc/parHelp.txt`; `mw.dat` (O2, N2) shipped with `dgCompHIT` | - | done | - | c336b968 | |
 | T-30 | HIT statistics in `dgCompHIT.udf`: `stat.dat` (`calc_stat`), `stat_ref.dat` (`hit_ref_stat`), `cons.dat` (`check_cons`), same columns and formats as `base.usr`; `[CASEDATA]` mu0, statInterval, consInterval | M2 | done | - | fd08f499 | Re_lambda uses the constant `mu0` until the transport properties (T-32) exist |
-| T-48 | `doc/dg/IMPLEMENTATION.md`: plugin layout, call flow, every `src/*.f` and `base.usr` routine mapped to its nekRS function or kernel with status | - | done | - | - | Keep it updated with each port |
+| T-48 | `doc/dg/IMPLEMENTATION.md`: plugin layout, call flow, every `src/*.f` and `base.usr` routine mapped to its nekRS function or kernel with status | - | done | - | 6eb19e02 | Keep it updated with each port |
+| T-18 | KEP flux-differencing volume kernel (`advect_volInt`, `getFlux_KEP`): `dgVolumeRhsHex3D` | M1 | done | - | - | Shared-memory primitives, one thread per (i,j) column. EC split off to T-49 |
+| T-19 | Inviscid surface flux and lift (`advect_interface`, `eval_lmf`, `riemann.f`): `dgSurfaceFluxHex3D` (LLF partial/full, HLL, HLLC, HLLC/HLL blend) and `dgSurfaceLiftHex3D` | M1 | done | - | - | `[DGCOMP] riemannSolver`, `blendSw0/blendSw1/blendSwRho`. Fully periodic meshes only: setup aborts on boundary faces until T-36 |
 
 ## 2. Pending (current: M0 and M1)
 
@@ -56,8 +58,7 @@ None of this code has been compiled yet.
 | T-15 | Separate `dg_dev` install on Aurora, run `examples/ethier` | M0 | todo | Prefix `$HOME/.local/nekrs-dg-aurora` |
 | T-16 | Module and env scripts per machine under `doc/dg/` | M0 | todo | |
 | T-17 | Compile `dgCompHIT`, run the M0 stub; the field should stay unchanged | M0 | todo | Also needs `hit_modes.dat`, `aa/h0/s0.dat` and the mesh copied in (`mw.dat` is in the example) |
-| T-18 | KEP and EC flux-differencing volume kernel (`advect_volInt`) | M1 | todo | Main performance kernel |
-| T-19 | LLF and HLLC surface flux, lift (`advect_interface`, `riemann.f`) | M1 | todo | |
+| T-49 | EC volume flux (`getFlux_EC`, `ifVolEC`) in `dgVolumeRhsHex3D` | M1 | todo | Setup aborts on `volumeFlux = ec` for now |
 | T-20 | CFL and adaptive dt (`compcfl.f`) | M1 | todo | |
 | T-21 | Restart from checkpoint (read rho, u, p, T, Y_k by name) | M1 | todo | The udf aborts on restart for now |
 | T-22 | Verification harness: CompNek5000 one-step dump plus compare script | M1 | todo | |
@@ -103,9 +104,9 @@ Stage is one of `configure`, `build`, `udf-compile`, `kernel-jit` or `run`.
 
 | ID | Date | Machine | Stage | Summary | Status | Fix / commit |
 |---|---|---|---|---|---|---|
-| B-01 | 2026-11-23 | - | - | Possible bug in the Fortran `fluxLF.f::eval_lmf`: `k` is incremented but never set to 0 first. The port initialises it. If results differ from Nek5000, check this first. | watch | - |
+| B-01 | 2026-11-23 | - | - | Possible bug in the Fortran `fluxLF.f::eval_lmf`: `k` is incremented but never set to 0 first. The port initialises it. If results differ from Nek5000, check this first. | closed | Not a bug: `k = 0` is set at `fluxLF.f:21`. `dgSurfaceFluxHex3D` takes the max of a+\|u.n\| over both sides pointwise |
 | B-02 | 2026-11-24 | - | run | No checkpoint written with `checkpointControl = simulationTime`, `checkpointInterval = 5e-8` (not even at the last step). `parseGeneral.hpp` stored the interval with `std::to_string` ("%f"), giving "0.000000", so the driver disabled output. Affects any interval below 1e-6. | done | `to_string_f` in `parseGeneral.hpp`; needs a nekRS rebuild |
-| B-03 | 2026-11-25 | - | run | Not a bug. In the compHIT outputs p stays at 1 bar, and u is about 2x the Nek5000 value at late times. Both happen because the volume and surface RHS are stubs (T-18, T-19), so the field stays frozen at the IC: urms stays at 120.5 while Nek5000 decays to 58.7 at 4.5 tau0. The IC matches `base.usr` (`fourierVelocity` = `hit_eval`). | explained | resolves with T-18/T-19 |
+| B-03 | 2026-11-25 | - | run | Not a bug. In the compHIT outputs p stays at 1 bar, and u is about 2x the Nek5000 value at late times. Both happen because the volume and surface RHS are stubs (T-18, T-19), so the field stays frozen at the IC: urms stays at 120.5 while Nek5000 decays to 58.7 at 4.5 tau0. The IC matches `base.usr` (`fourierVelocity` = `hit_eval`). | explained | T-18/T-19 are now in (inviscid). Rerun after rebuilding; the viscous decay also needs T-31/T-32 |
 
 ### Bug report template
 

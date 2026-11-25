@@ -11,11 +11,12 @@
 
 #include "dgComp.hpp"
 
-// Status (M0 scaffold): state allocation, primitives (perfect gas, or NASA
-// mixture with Newton for T),
-// trace gather and face exchange, SSPRK3 and the wave-speed reduction work.
-// The volume and surface RHS kernels are stubs that return zero, so a run
-// should leave the solution unchanged. See doc/dg/ROADMAP.md, M1.
+// Status (M1, inviscid): primitives (perfect gas, or NASA mixture with
+// Newton for T), trace gather and face exchange, KEP flux-differencing volume
+// term, LLF / HLL / HLLC / blended interface flux, SSPRK3 and the wave-speed
+// reduction. Not yet: EC volume flux, boundary conditions, viscous terms
+// (BR1), chemistry, positivity limiter, artificial viscosity.
+// See doc/dg/ROADMAP.md.
 
 namespace
 {
@@ -40,8 +41,15 @@ dlong fieldOffset = 0;
 dlong faceOffset = 0;
 
 struct options_t {
-  int riemannSolver = 0; // 0 LLF, 1 HLLC
-  int volumeFlux = 0;    // 0 KEP (Pirozzoli), 1 EC (Gouasmi)
+  // 0 LLF, 1 HLL, 2 HLLC, 3 HLLC blended into HLL (CompNek5000 userparam05)
+  int riemannSolver = 0;
+  int volumeFlux = 0; // 0 KEP (Pirozzoli), 1 EC (Gouasmi)
+  // riemann.f blend switch: alpha ramps 0 -> 1 as |dp|/(pL+pR) goes from
+  // blendSw0 to blendSw1, damped by |drho|/(rhoL+rhoR) / blendSwRho at
+  // subsonic faces
+  dfloat blendSw0 = 0.01;
+  dfloat blendSw1 = 0; // <= blendSw0 means 10 blendSw0
+  dfloat blendSwRho = 0.1;
   bool viscous = false;
   bool reacting = false;
   bool splitChemistry = false;
@@ -63,6 +71,7 @@ occa::memory o_rhs;   // dU/dt
 occa::memory o_primv; // primitives
 occa::memory o_faceM; // own trace, nTrace fields of faceOffset
 occa::memory o_faceP; // M + P after the face exchange
+occa::memory o_faceFlux; // lifted interface flux, nEq fields of faceOffset
 occa::memory o_lambda;
 
 occa::memory o_bi; // internal-energy polynomial, nspec*(npa+1)
@@ -75,7 +84,8 @@ occa::kernel primitivesKernel;
 occa::kernel conservedKernel;
 occa::kernel traceGatherKernel;
 occa::kernel volumeRhsKernel;
-occa::kernel surfaceRhsKernel;
+occa::kernel surfaceFluxKernel;
+occa::kernel surfaceLiftKernel;
 occa::kernel ssprkStageKernel;
 occa::kernel waveSpeedKernel;
 
@@ -110,12 +120,29 @@ std::string parString(const std::string &key, const std::string &defaultValue)
 void readOptions()
 {
   const auto riemann = parString("riemannsolver", "llf");
-  nekrsCheck(riemann != "llf" && riemann != "hllc",
+  const std::vector<std::string> riemannNames = {"llf", "hll", "hllc", "hllcblend"};
+  const auto it = std::find(riemannNames.begin(), riemannNames.end(), riemann);
+  nekrsCheck(it == riemannNames.end(),
              platform->comm.mpiComm(),
              EXIT_FAILURE,
-             "[DGCOMP] riemannSolver = %s is not supported (llf | hllc)\n",
+             "[DGCOMP] riemannSolver = %s is not supported (llf | hll | hllc | hllcBlend)\n",
              riemann.c_str());
-  opt.riemannSolver = (riemann == "hllc") ? 1 : 0;
+  opt.riemannSolver = static_cast<int>(it - riemannNames.begin());
+
+  // CompNek5000 userparam06..08, with the same fallbacks as riemann.f
+  opt.blendSw1 = 0;
+  platform->par->extract("dgcomp", "blendsw0", opt.blendSw0);
+  platform->par->extract("dgcomp", "blendsw1", opt.blendSw1);
+  platform->par->extract("dgcomp", "blendswrho", opt.blendSwRho);
+  if (!(opt.blendSw0 > 0)) {
+    opt.blendSw0 = 0.01;
+  }
+  if (!(opt.blendSw1 > opt.blendSw0)) {
+    opt.blendSw1 = 10 * opt.blendSw0;
+  }
+  if (!(opt.blendSwRho > 0)) {
+    opt.blendSwRho = 0.1;
+  }
 
   const auto vflux = parString("volumeflux", "kep");
   nekrsCheck(vflux != "kep" && vflux != "ec",
@@ -265,28 +292,32 @@ void checkReady(const char *caller)
              caller);
 }
 
-// dU/dt = volume + surface terms. Stubs until M1.
+// dU/dt = volume + surface terms (advect.f::advect, inviscid part).
+// Assumes o_primv is current for o_Ucons.
 void computeRhs(double time)
 {
   traceGatherKernel(mesh->Nelements, fieldOffset, faceOffset, mesh->o_vmapM, o_Ucons, o_primv, o_faceM);
   o_faceP.copyFrom(o_faceM, nTrace * faceOffset);
   oogs::startFinish(o_faceP, nTrace, faceOffset, ogsDfloat, ogsAdd, gshFace);
 
-  // TODO(M1): flux-differencing volume term (fluxLF.f / advect.f), KEP or EC
-  volumeRhsKernel(mesh->Nelements, fieldOffset, mesh->o_vgeo, mesh->o_D, o_Ucons, o_primv, o_rhs);
+  // KEP flux differencing (advect_volInt); sets o_rhs
+  volumeRhsKernel(mesh->Nelements, fieldOffset, mesh->o_vgeo, mesh->o_D, o_primv, o_rhs);
 
-  // TODO(M1): LLF / HLLC interface flux. P = o_faceP - o_faceM on interior
-  // faces; EToB > 0 marks boundary faces where P must come from a BC.
-  surfaceRhsKernel(mesh->Nelements,
-                   fieldOffset,
-                   faceOffset,
-                   mesh->o_vmapM,
-                   mesh->o_sgeo,
-                   mesh->o_vgeo,
-                   mesh->o_EToB,
-                   o_faceM,
-                   o_faceP,
-                   o_rhs);
+  // interface flux (advect_interface / advect_interface_riemann), interior
+  // faces only, then lift into o_rhs
+  const dlong Ntr = mesh->Nelements * mesh->Nfaces * mesh->Nfp;
+  surfaceFluxKernel(Ntr,
+                    faceOffset,
+                    opt.riemannSolver,
+                    static_cast<int>(opt.fullInterfaceLLF),
+                    opt.blendSw0,
+                    opt.blendSw1,
+                    opt.blendSwRho,
+                    mesh->o_sgeo,
+                    o_faceM,
+                    o_faceP,
+                    o_faceFlux);
+  surfaceLiftKernel(mesh->Nelements, fieldOffset, faceOffset, o_faceFlux, o_rhs);
 
   // TODO(M2): BR1 viscous terms, transport from the Cantera host bridge
   // TODO(M4): unsplit chemistry source when reacting && !splitChemistry
@@ -388,7 +419,8 @@ void dgComp::buildKernel(occa::properties kernelInfo)
   conservedKernel = buildKernel("dgConserved");
   traceGatherKernel = buildKernel("dgTraceGather");
   volumeRhsKernel = buildKernel("dgVolumeRhsHex3D");
-  surfaceRhsKernel = buildKernel("dgSurfaceRhsHex3D");
+  surfaceFluxKernel = buildKernel("dgSurfaceFluxHex3D");
+  surfaceLiftKernel = buildKernel("dgSurfaceLiftHex3D");
   ssprkStageKernel = buildKernel("dgSSPRKStage");
   waveSpeedKernel = buildKernel("dgWaveSpeed");
 }
@@ -438,13 +470,36 @@ void setupImpl(const dgComp::thermo_t &th)
 
   readOptions();
 
-  nekrsCheck(opt.riemannSolver != 0 || opt.reacting || opt.positivityLimiter || opt.artificialViscosity,
+  nekrsCheck(opt.reacting || opt.positivityLimiter || opt.artificialViscosity,
              platform->comm.mpiComm(),
              EXIT_FAILURE,
              "%s\n",
-             "dgComp: only LLF without chemistry, limiter or AV is implemented so far; see doc/dg/ROADMAP.md");
+             "dgComp: chemistry, positivity limiter and AV are not implemented yet; see doc/dg/ROADMAP.md");
+  nekrsCheck(opt.volumeFlux != 0,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "dgComp: volumeFlux = ec is not implemented yet, use kep");
   if (opt.viscous && platform->comm.mpiRank() == 0) {
     printf("dgComp: WARNING viscous = yes but viscous terms are not implemented yet (M2), running inviscid\n");
+  }
+
+  // No boundary states yet: the interface kernel treats every face as an
+  // interior (or periodic) one.
+  {
+    int nBoundaryFaces = 0;
+    for (dlong f = 0; f < mesh->Nelements * mesh->Nfaces; f++) {
+      if (mesh->EToB[f] > 0) {
+        nBoundaryFaces++;
+      }
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &nBoundaryFaces, 1, MPI_INT, MPI_SUM, platform->comm.mpiComm());
+    nekrsCheck(nBoundaryFaces > 0,
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "dgComp: mesh has %d boundary faces, but boundary conditions are not implemented yet "
+               "(fully periodic meshes only)\n",
+               nBoundaryFaces);
   }
 
   // trace layout: e*Nfaces*Nfp + f*Nfp + n, nTrace fields
@@ -457,6 +512,7 @@ void setupImpl(const dgComp::thermo_t &th)
   o_primv = platform->device.malloc<dfloat>(nPrim * fieldOffset);
   o_faceM = platform->device.malloc<dfloat>(nTrace * faceOffset);
   o_faceP = platform->device.malloc<dfloat>(nTrace * faceOffset);
+  o_faceFlux = platform->device.malloc<dfloat>(nEq * faceOffset);
   o_lambda = platform->device.malloc<dfloat>(fieldOffset);
 
   platform->linAlg->fill(nEq * fieldOffset, 0.0, o_Ucons);
@@ -492,13 +548,19 @@ void setupImpl(const dgComp::thermo_t &th)
     } else {
       printf("dgComp: thermo=nasa\n");
     }
+    const char *riemannNames[] = {"llf", "hll", "hllc", "hllcBlend"};
     printf("dgComp: nspec=%d npa=%d nEq=%d riemann=%s volumeFlux=%s clip=%d\n",
            nspec,
            npa,
            nEq,
-           opt.riemannSolver ? "hllc" : "llf",
+           riemannNames[opt.riemannSolver],
            opt.volumeFlux ? "ec" : "kep",
            opt.clip);
+    if (opt.riemannSolver == 0) {
+      printf("dgComp: fullInterfaceLLF=%d\n", opt.fullInterfaceLLF);
+    } else if (opt.riemannSolver == 3) {
+      printf("dgComp: blendSw0=%g blendSw1=%g blendSwRho=%g\n", opt.blendSw0, opt.blendSw1, opt.blendSwRho);
+    }
     printf("dgComp: viscous=%d reacting=%d splitChemistry=%d dtChem=%g\n",
            opt.viscous,
            opt.reacting,

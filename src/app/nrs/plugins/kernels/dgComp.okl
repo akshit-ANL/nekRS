@@ -204,26 +204,154 @@
   }
 }
 
-// STUB (M1): flux-differencing volume term.
-// Port fluxLF.f / advect.f: for each node, sum_j 2 D_ij F#(U_i, U_j) along
-// r, s, t with the Pirozzoli KEP (volumeFlux = kep) or Gouasmi EC two-point
-// flux, contravariant metrics from vgeo, scaled by vgeo[p_IJWID] (= 1/(J w)).
-// Currently sets rhs = 0.
+// Pirozzoli KEP two-point flux (advect.f::getFlux_KEP) between node 1 and
+// node 2, contracted with the metric vector m = (mx, my, mz) of node 1 and
+// multiplied by c (= 2 D_il). Added to f.
+//   rho Y_k: {rho}{u.m}{Y_k}
+//   rho u_d: {rho}{u.m}{u_d} + {p} m_d
+//   rho E:   {rho}{u.m}{H},   H = (rho E + p)/rho
+// Node 2 mass fractions are read from P at id2.
+void kepFluxAdd(const dfloat c,
+                const dfloat mx,
+                const dfloat my,
+                const dfloat mz,
+                const dfloat rho1,
+                const dfloat u1,
+                const dfloat v1,
+                const dfloat w1,
+                const dfloat p1,
+                const dfloat H1,
+                const dfloat *Y1,
+                const dfloat rho2,
+                const dfloat u2,
+                const dfloat v2,
+                const dfloat w2,
+                const dfloat p2,
+                const dfloat H2,
+                const dfloat *P,
+                const dlong id2,
+                const dlong offset,
+                dfloat *f)
+{
+  const dfloat uA = 0.5 * (u1 + u2);
+  const dfloat vA = 0.5 * (v1 + v2);
+  const dfloat wA = 0.5 * (w1 + w2);
+  const dfloat unA = uA * mx + vA * my + wA * mz;
+  const dfloat cpA = c * 0.5 * (p1 + p2);
+  const dfloat mflux = c * 0.5 * (rho1 + rho2) * unA;
+
+  f[0] += mflux * uA + cpA * mx;
+  f[1] += mflux * vA + cpA * my;
+  f[2] += mflux * wA + cpA * mz;
+  f[3] += mflux * 0.5 * (H1 + H2);
+  for (int s = 0; s < p_Nspec; s++) {
+    f[4 + s] += mflux * 0.5 * (Y1[s] + P[id2 + (p_PY0 + s) * offset]);
+  }
+}
+
+// Flux-differencing volume term, port of advect.f::advect_volInt (KEP only).
+// Fortran, per node (i,j,k):
+//   rkRHS = sum_l 2 D(i,l) F#((i,j,k),(l,j,k)).(rx,ry,rz)
+//         + sum_l 2 D(j,l) F#((i,j,k),(i,l,k)).(sx,sy,sz)
+//         + sum_l 2 D(k,l) F#((i,j,k),(i,j,l)).(tx,ty,tz)
+// with Nek5000 rxm1/jacm1 = dr/dx, which is what vgeo holds. The metrics are
+// those of node (i,j,k), not averaged, as in the Fortran.
+// rkRHS is -dU/dt, so rhs = -rkRHS. This kernel sets rhs; the surface lift
+// adds to it afterwards.
+// Shared memory: 6 Nq^3 + Nq^2 dfloats (24.6 kB at N = 7). Mass fractions of
+// the partner node are read from global memory to keep this independent of
+// nspec.
 @kernel void dgVolumeRhsHex3D(const dlong Nelements,
                               const dlong offset,
                               @ restrict const dfloat *vgeo,
                               @ restrict const dfloat *D,
-                              @ restrict const dfloat *U,
                               @ restrict const dfloat *P,
                               @ restrict dfloat *rhs)
 {
   for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_rho[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_u[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_v[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_w[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_p[p_Nq][p_Nq][p_Nq];
+    @shared dfloat s_H[p_Nq][p_Nq][p_Nq];
+
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        s_D[j][i] = D[j * p_Nq + i];
+        for (int k = 0; k < p_Nq; ++k) {
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          s_rho[k][j][i] = P[id + p_PRHO * offset];
+          s_u[k][j][i] = P[id + p_PU * offset];
+          s_v[k][j][i] = P[id + p_PV * offset];
+          s_w[k][j][i] = P[id + p_PW * offset];
+          s_p[k][j][i] = P[id + p_PP * offset];
+          s_H[k][j][i] = P[id + p_PH * offset];
+        }
+      }
+    }
+
+    @barrier();
+
     for (int j = 0; j < p_Nq; ++j; @inner(1)) {
       for (int i = 0; i < p_Nq; ++i; @inner(0)) {
         for (int k = 0; k < p_Nq; ++k) {
           const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
-          for (int f = 0; f < p_Neq; f++) {
-            rhs[id + f * offset] = 0;
+          const dlong gid = e * p_Np * p_Nvgeo + k * p_Nfp + j * p_Nq + i;
+          const dfloat rx = vgeo[gid + p_RXID * p_Np];
+          const dfloat ry = vgeo[gid + p_RYID * p_Np];
+          const dfloat rz = vgeo[gid + p_RZID * p_Np];
+          const dfloat sx = vgeo[gid + p_SXID * p_Np];
+          const dfloat sy = vgeo[gid + p_SYID * p_Np];
+          const dfloat sz = vgeo[gid + p_SZID * p_Np];
+          const dfloat tx = vgeo[gid + p_TXID * p_Np];
+          const dfloat ty = vgeo[gid + p_TYID * p_Np];
+          const dfloat tz = vgeo[gid + p_TZID * p_Np];
+
+          const dfloat rho1 = s_rho[k][j][i];
+          const dfloat u1 = s_u[k][j][i];
+          const dfloat v1 = s_v[k][j][i];
+          const dfloat w1 = s_w[k][j][i];
+          const dfloat p1 = s_p[k][j][i];
+          const dfloat H1 = s_H[k][j][i];
+          dfloat Y1[p_Nspec];
+          for (int s = 0; s < p_Nspec; s++) {
+            Y1[s] = P[id + (p_PY0 + s) * offset];
+          }
+
+          dfloat f[p_Neq];
+          for (int q = 0; q < p_Neq; q++) {
+            f[q] = 0;
+          }
+
+          // r direction, partner (l,j,k)
+          for (int l = 0; l < p_Nq; ++l) {
+            const dlong id2 = e * p_Np + k * p_Nfp + j * p_Nq + l;
+            kepFluxAdd(2 * s_D[i][l], rx, ry, rz,
+                       rho1, u1, v1, w1, p1, H1, Y1,
+                       s_rho[k][j][l], s_u[k][j][l], s_v[k][j][l], s_w[k][j][l], s_p[k][j][l], s_H[k][j][l],
+                       P, id2, offset, f);
+          }
+          // s direction, partner (i,l,k)
+          for (int l = 0; l < p_Nq; ++l) {
+            const dlong id2 = e * p_Np + k * p_Nfp + l * p_Nq + i;
+            kepFluxAdd(2 * s_D[j][l], sx, sy, sz,
+                       rho1, u1, v1, w1, p1, H1, Y1,
+                       s_rho[k][l][i], s_u[k][l][i], s_v[k][l][i], s_w[k][l][i], s_p[k][l][i], s_H[k][l][i],
+                       P, id2, offset, f);
+          }
+          // t direction, partner (i,j,l)
+          for (int l = 0; l < p_Nq; ++l) {
+            const dlong id2 = e * p_Np + l * p_Nfp + j * p_Nq + i;
+            kepFluxAdd(2 * s_D[k][l], tx, ty, tz,
+                       rho1, u1, v1, w1, p1, H1, Y1,
+                       s_rho[l][j][i], s_u[l][j][i], s_v[l][j][i], s_w[l][j][i], s_p[l][j][i], s_H[l][j][i],
+                       P, id2, offset, f);
+          }
+
+          for (int q = 0; q < p_Neq; q++) {
+            rhs[id + q * offset] = -f[q];
           }
         }
       }
@@ -231,35 +359,306 @@
   }
 }
 
-// STUB (M1): interface term.
-// On interior faces the neighbour value is faceP - faceM (faceP holds M + P
-// after the gs-add). EToB[e*p_Nfaces + face] > 0 marks a boundary face where
-// P must come from a boundary condition instead. Port the LLF (fluxLF.f) and
-// HLLC numerical fluxes; add (F* - F_M).n * sgeo[p_WSJID] * vgeo[p_IJWID] to
-// rhs[idM]. Corner and edge nodes belong to several faces, so loop over the
-// faces of an element in sequence to avoid write races.
-// Currently adds nothing.
-@kernel void dgSurfaceRhsHex3D(const dlong Nelements,
-                               const dlong offset,
-                               const dlong faceOffset,
-                               @ restrict const dlong *vmapM,
-                               @ restrict const dfloat *sgeo,
-                               @ restrict const dfloat *vgeo,
-                               @ restrict const int *EToB,
-                               @ restrict const dfloat *faceM,
-                               @ restrict const dfloat *faceP,
-                               @ restrict dfloat *rhs)
+// Physical normal flux F(U).n of one state (riemann.f::phys_flux).
+// E is total energy per volume (rho E).
+void physFlux(const dfloat nx,
+              const dfloat ny,
+              const dfloat nz,
+              const dfloat rho,
+              const dfloat u,
+              const dfloat v,
+              const dfloat w,
+              const dfloat p,
+              const dfloat E,
+              const dfloat *Y,
+              dfloat *f)
+{
+  const dfloat un = u * nx + v * ny + w * nz;
+  f[0] = rho * u * un + p * nx;
+  f[1] = rho * v * un + p * ny;
+  f[2] = rho * w * un + p * nz;
+  f[3] = (E + p) * un;
+  for (int s = 0; s < p_Nspec; s++) {
+    f[4 + s] = rho * Y[s] * un;
+  }
+}
+
+// HLL flux (riemann.f::flux_hll); q* are the conserved states.
+void fluxHLL(const dfloat sL,
+             const dfloat sR,
+             const dfloat *fL,
+             const dfloat *fR,
+             const dfloat *qL,
+             const dfloat *qR,
+             dfloat *f)
+{
+  if (sL >= 0) {
+    for (int q = 0; q < p_Neq; q++) {
+      f[q] = fL[q];
+    }
+  } else if (sR <= 0) {
+    for (int q = 0; q < p_Neq; q++) {
+      f[q] = fR[q];
+    }
+  } else {
+    const dfloat inv = 1 / (sR - sL);
+    for (int q = 0; q < p_Neq; q++) {
+      f[q] = (sR * fL[q] - sL * fR[q] + sL * sR * (qR[q] - qL[q])) * inv;
+    }
+  }
+}
+
+// Toro's HLLC flux (riemann.f::flux_hllc).
+void fluxHLLC(const dfloat sL,
+              const dfloat sR,
+              const dfloat nx,
+              const dfloat ny,
+              const dfloat nz,
+              const dfloat rhoL,
+              const dfloat uL,
+              const dfloat vL,
+              const dfloat wL,
+              const dfloat pL,
+              const dfloat EL,
+              const dfloat *YL,
+              const dfloat *fL,
+              const dfloat *qL,
+              const dfloat rhoR,
+              const dfloat uR,
+              const dfloat vR,
+              const dfloat wR,
+              const dfloat pR,
+              const dfloat ER,
+              const dfloat *YR,
+              const dfloat *fR,
+              const dfloat *qR,
+              dfloat *f)
+{
+  if (sL >= 0) {
+    for (int q = 0; q < p_Neq; q++) {
+      f[q] = fL[q];
+    }
+    return;
+  }
+  if (sR <= 0) {
+    for (int q = 0; q < p_Neq; q++) {
+      f[q] = fR[q];
+    }
+    return;
+  }
+
+  const dfloat unL = uL * nx + vL * ny + wL * nz;
+  const dfloat unR = uR * nx + vR * ny + wR * nz;
+  const dfloat sM = (pR - pL + rhoL * unL * (sL - unL) - rhoR * unR * (sR - unR)) /
+                    (rhoL * (sL - unL) - rhoR * (sR - unR));
+
+  const int left = (sM >= 0);
+  const dfloat sK = left ? sL : sR;
+  const dfloat rhoK = left ? rhoL : rhoR;
+  const dfloat uK = left ? uL : uR;
+  const dfloat vK = left ? vL : vR;
+  const dfloat wK = left ? wL : wR;
+  const dfloat pK = left ? pL : pR;
+  const dfloat EK = left ? EL : ER;
+  const dfloat unK = left ? unL : unR;
+  const dfloat *YK = left ? YL : YR;
+  const dfloat *fK = left ? fL : fR;
+  const dfloat *qK = left ? qL : qR;
+
+  const dfloat fac = rhoK * (sK - unK) / (sK - sM);
+  dfloat qs[p_Neq];
+  qs[0] = fac * (uK + (sM - unK) * nx);
+  qs[1] = fac * (vK + (sM - unK) * ny);
+  qs[2] = fac * (wK + (sM - unK) * nz);
+  qs[3] = fac * (EK / rhoK + (sM - unK) * (sM + pK / (rhoK * (sK - unK))));
+  for (int s = 0; s < p_Nspec; s++) {
+    qs[4 + s] = fac * YK[s];
+  }
+
+  for (int q = 0; q < p_Neq; q++) {
+    f[q] = fK[q] + sK * (qs[q] - qK[q]);
+  }
+}
+
+// Interface flux at every trace node, port of advect.f::advect_interface
+// (solver 0, LLF) and riemann.f::advect_interface_riemann (1 HLL, 2 HLLC,
+// 3 HLLC blended into HLL). Same numbering as CompNek5000 userparam05.
+// M = own face state, P = neighbour = faceP - faceM (faceP holds M + P after
+// the gs-add). Interior faces only: setup refuses meshes with boundary faces.
+// Writes the lifted contribution with the nekRS sign,
+//   faceFlux = -(F* - F(U_M)).n * sJ w_face / (J w_vol),
+// which the Fortran adds as +(F* - F_M).n area/bm1 to rkRHS (= -dU/dt).
+// LLF: F* = Fnd.n - lambda/2 (U_P - U_M), lambda = max over both sides of
+// a + |u.n| (eval_lmf), and Fnd either the KEP average of the two face states
+// (fullLLF = 0, Fortran default) or (F(U_M) + F(U_P))/2 (fullLLF = 1,
+// ifIntLLFfull).
+@kernel void dgSurfaceFluxHex3D(const dlong Ntrace,
+                                const dlong faceOffset,
+                                const int solver,
+                                const int fullLLF,
+                                const dfloat sw0,
+                                const dfloat sw1,
+                                const dfloat swRho,
+                                @ restrict const dfloat *sgeo,
+                                @ restrict const dfloat *faceM,
+                                @ restrict const dfloat *faceP,
+                                @ restrict dfloat *faceFlux)
+{
+  for (dlong sk = 0; sk < Ntrace; ++sk; @tile(p_blockSize, @outer, @inner)) {
+    if (sk < Ntrace) {
+      const dfloat nx = sgeo[sk * p_Nsgeo + p_NXID];
+      const dfloat ny = sgeo[sk * p_Nsgeo + p_NYID];
+      const dfloat nz = sgeo[sk * p_Nsgeo + p_NZID];
+      const dfloat scale = sgeo[sk * p_Nsgeo + p_WSJID] * sgeo[sk * p_Nsgeo + p_IJWID];
+
+      // conserved states
+      dfloat qM[p_Neq], qP[p_Neq];
+      for (int q = 0; q < p_Neq; q++) {
+        qM[q] = faceM[sk + q * faceOffset];
+        qP[q] = faceP[sk + q * faceOffset] - qM[q];
+      }
+
+#define primM(fld) faceM[sk + (p_Neq + (fld)) * faceOffset]
+#define primP(fld) (faceP[sk + (p_Neq + (fld)) * faceOffset] - primM(fld))
+      const dfloat rhoM = primM(p_PRHO), rhoP = primP(p_PRHO);
+      const dfloat uM = primM(p_PU), uP = primP(p_PU);
+      const dfloat vM = primM(p_PV), vP = primP(p_PV);
+      const dfloat wM = primM(p_PW), wP = primP(p_PW);
+      const dfloat pM = primM(p_PP), pP = primP(p_PP);
+      const dfloat HM = primM(p_PH), HP = primP(p_PH);
+      dfloat YM[p_Nspec], YP[p_Nspec];
+      for (int s = 0; s < p_Nspec; s++) {
+        YM[s] = primM(p_PY0 + s);
+        YP[s] = primP(p_PY0 + s);
+      }
+
+      const dfloat unM = uM * nx + vM * ny + wM * nz;
+      const dfloat unP = uP * nx + vP * ny + wP * nz;
+
+      dfloat fM[p_Neq], fP[p_Neq], fs[p_Neq];
+      physFlux(nx, ny, nz, rhoM, uM, vM, wM, pM, qM[3], YM, fM);
+      physFlux(nx, ny, nz, rhoP, uP, vP, wP, pP, qP[3], YP, fP);
+
+      if (solver == 0) {
+        const dfloat lambda = fmax(primM(p_PASPD) + fabs(unM), primP(p_PASPD) + fabs(unP));
+        if (fullLLF) {
+          for (int q = 0; q < p_Neq; q++) {
+            fs[q] = 0.5 * (fM[q] + fP[q]);
+          }
+        } else {
+          const dfloat uA = 0.5 * (uM + uP);
+          const dfloat vA = 0.5 * (vM + vP);
+          const dfloat wA = 0.5 * (wM + wP);
+          const dfloat pA = 0.5 * (pM + pP);
+          const dfloat mflux = 0.5 * (rhoM + rhoP) * (uA * nx + vA * ny + wA * nz);
+          fs[0] = mflux * uA + pA * nx;
+          fs[1] = mflux * vA + pA * ny;
+          fs[2] = mflux * wA + pA * nz;
+          fs[3] = mflux * 0.5 * (HM + HP);
+          for (int s = 0; s < p_Nspec; s++) {
+            fs[4 + s] = mflux * 0.5 * (YM[s] + YP[s]);
+          }
+        }
+        for (int q = 0; q < p_Neq; q++) {
+          fs[q] -= 0.5 * lambda * (qP[q] - qM[q]);
+        }
+      } else {
+        const dfloat aM = sqrt(primM(p_PGAMMA) * pM / rhoM);
+        const dfloat aP = sqrt(primP(p_PGAMMA) * pP / rhoP);
+
+        // Davis wave speed estimates
+        const dfloat sL = fmin(unM - aM, unP - aP);
+        const dfloat sR = fmax(unM + aM, unP + aP);
+
+        dfloat alpha = 0;
+        if (solver == 1) {
+          alpha = 1;
+        } else if (solver == 3) {
+          const dfloat sp = fabs(pP - pM) / (pP + pM);
+          alpha = fmin(1.0, fmax(0.0, (sp - sw0) / (sw1 - sw0)));
+          if (fabs(unM) / aM < 1 || fabs(unP) / aP < 1) {
+            const dfloat srho = fabs(rhoP - rhoM) / (rhoP + rhoM);
+            alpha *= fmax(0.0, 1 - srho / swRho);
+          }
+        }
+
+        dfloat fhll[p_Neq];
+        if (alpha > 0) {
+          fluxHLL(sL, sR, fM, fP, qM, qP, fhll);
+        }
+        if (alpha < 1) {
+          fluxHLLC(sL, sR, nx, ny, nz,
+                   rhoM, uM, vM, wM, pM, qM[3], YM, fM, qM,
+                   rhoP, uP, vP, wP, pP, qP[3], YP, fP, qP,
+                   fs);
+        }
+        if (alpha >= 1) {
+          for (int q = 0; q < p_Neq; q++) {
+            fs[q] = fhll[q];
+          }
+        } else if (alpha > 0) {
+          for (int q = 0; q < p_Neq; q++) {
+            fs[q] = alpha * fhll[q] + (1 - alpha) * fs[q];
+          }
+        }
+      }
+#undef primM
+#undef primP
+
+      for (int q = 0; q < p_Neq; q++) {
+        faceFlux[sk + q * faceOffset] = -(fs[q] - fM[q]) * scale;
+      }
+    }
+  }
+}
+
+// Add the face contributions from dgSurfaceFluxHex3D to rhs. Thread (i,j)
+// owns the column (i,j,0..Nq-1), so the edge and corner nodes shared by
+// several faces are summed by a single thread (no write races).
+// Face node ordering (meshBasisHex3D.cpp::FaceNodesHex3D):
+//   face 0 (t=-1), 5 (t=+1): n = i + j Nq
+//   face 1 (s=-1), 3 (s=+1): n = i + k Nq
+//   face 4 (r=-1), 2 (r=+1): n = j + k Nq
+@kernel void dgSurfaceLiftHex3D(const dlong Nelements,
+                                const dlong offset,
+                                const dlong faceOffset,
+                                @ restrict const dfloat *faceFlux,
+                                @ restrict dfloat *rhs)
 {
   for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
-    for (int n = 0; n < p_Nfp; ++n; @inner(0)) {
-      for (int face = 0; face < p_Nfaces; face++) {
-        const dlong sk = e * p_NfacesNfp + face * p_Nfp + n;
-        const dlong idM = vmapM[sk];
-        const int bc = EToB[e * p_Nfaces + face];
-        if (bc > 0) {
-          // TODO(M3): boundary state
+    for (int j = 0; j < p_Nq; ++j; @inner(1)) {
+      for (int i = 0; i < p_Nq; ++i; @inner(0)) {
+        const dlong base = e * p_NfacesNfp;
+        const int onSide = (i == 0 || i == p_Nq - 1 || j == 0 || j == p_Nq - 1);
+        for (int k = 0; k < p_Nq; ++k) {
+          if (!onSide && k != 0 && k != p_Nq - 1) {
+            continue;
+          }
+          const dlong id = e * p_Np + k * p_Nfp + j * p_Nq + i;
+          for (int q = 0; q < p_Neq; q++) {
+            const dfloat *ff = faceFlux + q * faceOffset + base;
+            dfloat s = 0;
+            if (k == 0) {
+              s += ff[0 * p_Nfp + i + j * p_Nq];
+            }
+            if (k == p_Nq - 1) {
+              s += ff[5 * p_Nfp + i + j * p_Nq];
+            }
+            if (j == 0) {
+              s += ff[1 * p_Nfp + i + k * p_Nq];
+            }
+            if (j == p_Nq - 1) {
+              s += ff[3 * p_Nfp + i + k * p_Nq];
+            }
+            if (i == 0) {
+              s += ff[4 * p_Nfp + j + k * p_Nq];
+            }
+            if (i == p_Nq - 1) {
+              s += ff[2 * p_Nfp + j + k * p_Nq];
+            }
+            rhs[id + q * offset] += s;
+          }
         }
-        // TODO(M1): numerical flux, lift into rhs[idM + f * offset]
       }
     }
   }

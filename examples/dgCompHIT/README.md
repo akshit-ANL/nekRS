@@ -9,20 +9,18 @@ This is the nekRS port of the CompNek5000 case
 
 It is the main validation case for the DG port (see `doc/dg/ROADMAP.md`).
 
-**Status: M0 scaffold.**
-- The volume and surface RHS kernels are still stubs that return zero.
-- A run should therefore leave the initial field unchanged.
-  - Every checkpoint shows the same field: p = p0 = 1 bar everywhere, T = T0, and urms = 120.5 m/s.
-  - This is expected. Compared with the Nek5000 run, the velocity looks too high (about 2x at the end time, where Nek5000 has decayed to urms = 58.7 m/s). Nek5000's pressure and temperature fluctuations also have no counterpart here.
-  - Only step 0 can be compared with Nek5000 until the fluxes land.
-- This exercises setup, the EOS/Newton primitives, the face exchange, SSPRK3 and checkpointing, not the physics.
+**Status: M1, inviscid.**
+- The inviscid RHS is in: KEP volume flux, and the LLF, HLL, HLLC or blended HLLC/HLL interface flux (`[DGCOMP] riemannSolver`). Not compiled or run yet.
+- Viscous terms (BR1 and the Cantera transport properties, M2) are not implemented, so `viscous = no` for now.
+  - The run is therefore inviscid. It does **not** reproduce the viscous Nek5000 reference (urms decays to 58.7 m/s at 4.5 tau0); only numerical dissipation removes energy here.
+  - To compare now, run CompNek5000 with `ifviscous = .false.` and the same flux settings (`ifVolEC = .false.`, `uparam(5)` = `riemannSolver`, `ifIntLLFfull` = `fullInterfaceLLF`, same dt). Or compare the step-0 RHS, see `doc/dg/IMPLEMENTATION.md` §5.
+- No CFL control yet: dt is fixed from the par file.
 - See `doc/dg/IMPLEMENTATION.md` for which Fortran routines are ported.
-- Viscous terms (M2) are not implemented, so `viscous = no` for now.
 
 ## Parameters
 
 The par file has two user sections:
-- `[DGCOMP]` is read by the plugin: thermo model, species, flux choices, feature switches, and CompNek5000 `userparam01..05` (`dtChem`, `avCstar`, `avCmax`, `avP`, `riemannSolver`).
+- `[DGCOMP]` is read by the plugin: thermo model, species, flux choices, feature switches, and CompNek5000 `userparam01..08` (`dtChem`, `avCstar`, `avCmax`, `avP`, `riemannSolver`, `blendSw0`, `blendSw1`, `blendSwRho`).
 - `[CASEDATA]` is read by `dgCompHIT.udf` in `UDF_Setup0`, with plain `platform->par->extract` calls as in the other examples. These used to be hard-coded in `base.usr`. `checkCaseData()` checks them in `UDF_Setup`, once the plugin knows nspec.
 
 | key | meaning | default |

@@ -296,9 +296,19 @@ npa                         <int>                                      cp polyno
 species                     <string>, <string>, ...                    species names for output (Y_O2, Y_N2, ...)
                             Y_00, Y_01, ... [D]                        same order as aa.dat/h0.dat/s0.dat/mw.dat
 
-riemannSolver               llf [D], hllc                              interface flux
+riemannSolver               llf [D], hll, hllc, hllcBlend              interface flux (userparam05 = 0, 1, 2, 3)
+                                                                       hllcBlend: HLLC, blended into HLL at
+                                                                       pressure jumps
+
+blendSw0                    <float>                                    hllcBlend: |dp|/(pL+pR) where HLL starts
+                            0.01 [D]                                   (userparam06)
+blendSw1                    <float>                                    hllcBlend: |dp|/(pL+pR) of pure HLL
+                            10*blendSw0 [D]                            (userparam07)
+blendSwRho                  <float>                                    hllcBlend: density-jump damping of the
+                            0.1 [D]                                    blend at subsonic faces (userparam08)
 
 volumeFlux                  kep [D], ec                                kinetic-energy preserving or entropy conserving
+                                                                       (ec not implemented yet)
 
 viscous                     true, false [D]
 reacting                    true, false [D]

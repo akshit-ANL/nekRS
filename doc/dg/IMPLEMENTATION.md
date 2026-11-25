@@ -12,17 +12,17 @@ Last updated: 2026-11-25
 
 ## 1. Why there are only three plugin files
 
-`CompNek5000/src` has 14 Fortran files plus the `COMPRESS` include, about 4.3k lines. The plugin has 1.1k lines in three files.
+`CompNek5000/src` has 14 Fortran files plus the `COMPRESS` include, about 4.3k lines. The plugin has 1.6k lines in three files.
 
 | file | lines | role |
 |---|---|---|
-| `src/app/nrs/plugins/dgComp.hpp` | 145 | public API (`dgComp::` namespace), primitive field indices `dgComp::prim` |
-| `src/app/nrs/plugins/dgComp.cpp` | 703 | host side: options, thermo input, memory, face exchange setup, RK driver, checkpoint fields |
-| `src/app/nrs/plugins/kernels/dgComp.okl` | 299 | device kernels, one per pointwise or per-element operation |
+| `src/app/nrs/plugins/dgComp.hpp` | 148 | public API (`dgComp::` namespace), primitive field indices `dgComp::prim` |
+| `src/app/nrs/plugins/dgComp.cpp` | 765 | host side: options, thermo input, memory, face exchange setup, RK driver, checkpoint fields |
+| `src/app/nrs/plugins/kernels/dgComp.okl` | 698 | device kernels, one per pointwise or per-element operation |
 
 The code is short for three reasons.
 
-1. **Most of the physics is not ported yet.** The plugin is at milestone M0/M1. The volume flux, the interface flux, the boundary conditions, the CFL, the viscous terms, entropy viscosity, the limiter and the chemistry are stubs or absent. That accounts for about 3k of the 4.3k Fortran lines; see the *Status* column in §3. The plugin grows as those land. The kernels stay in `dgComp.okl`, which can be split per topic later (for example `dgFlux.okl`, `dgViscous.okl`) without changing the API.
+1. **Most of the physics is not ported yet.** The plugin is at milestone M1. The inviscid fluxes are in (KEP volume flux; LLF, HLL, HLLC and blended interface fluxes). The EC volume flux, the boundary conditions, the CFL, the viscous terms, entropy viscosity, the limiter and the chemistry are absent. That accounts for about 2.5k of the 4.3k Fortran lines; see the *Status* column in §3. The plugin grows as those land. The kernels stay in `dgComp.okl`, which can be split per topic later (for example `dgFlux.okl`, `dgViscous.okl`) without changing the API.
 2. **nekRS supplies what the Fortran built by hand.** These include `full2face`, `gs_op` on `dg_hndlx`, `bm1`/`jacmi`, `rxm1..tzm1`, `area`/`unx`, `dg_setup` and the `.fld` I/O. In nekRS they are `mesh->vmapM`, `oogs` on `mesh->globalFaceIds`, `mesh->o_vgeo`/`o_sgeo`, `mesh->o_LMM` and the checkpoint writer.
 3. **Small Fortran helpers become one line inside a kernel.** For example `eval_EOS_D` is `rho = p / (Ru T sum(Y/W))` in `dgConserved`, and `eval_dgeh` is `h = (rhoE + p)/rho` in `dgPrimitives`.
 
@@ -40,7 +40,8 @@ Case-specific code from `base.usr` (initial condition, statistics) lives in the 
 | `bi, aa, h0, s0, mw` (`comp_vars11`, `comp_vars2`) | `o_bi`, `o_aa`, `o_mw` (device), `dgComp::thermo_t` (host) |
 | `*f` (own trace) and `*pi` (self + neighbour) face arrays (`comp_flux2/3`, `comp_temp1`) | `o_faceM`, `o_faceP`, `p_Ntrace = Neq + Nprim` fields of stride `faceOffset` |
 | `ifviscous, ifavisc, ifsplitchem, ifclip, ifpplim, ifIntLLFfull, ifVolEC` (`comp_flags*`) | `opt` struct in `dgComp.cpp`, filled from the `[DGCOMP]` par section (`viscous`, `artificialViscosity`, `splitChemistry`, `clip`, `positivityLimiter`, `fullInterfaceLLF`, `volumeFlux = kep / ec`) |
-| `uparam(1..5)` | `[DGCOMP] dtChem, avCstar, avCmax, avP, riemannSolver` |
+| `uparam(1..5)` | `[DGCOMP] dtChem, avCstar, avCmax, avP, riemannSolver` (`llf, hll, hllc, hllcBlend` = 0..3) |
+| `uparam(6..8)` (blend switch, `riemann.f`) | `[DGCOMP] blendSw0, blendSw1, blendSwRho`, same fallbacks (0.01, 10·sw0, 0.1) |
 | `lmf, enmu, enhe, rhoS1/2, vis1, cond1, diff1, wdot, ss` | not allocated yet (M2 to M4) |
 
 Primitives with no nekRS field yet: `spd`, `mach`, `ss`/`si` (entropy), `Xi` (mole fractions), transport, `wdot`.
@@ -55,8 +56,9 @@ nekRS time loop (solver = none, so nekRS only advances time and writes checkpoin
    │   └─ 3 stages:
    │       ├─ computeRhs(t)                     [dgrhs.f::getdgrhs, advect.f::advect]
    │       │   ├─ dgTraceGather + oogs add      [fluxLF.f::sum_neighbor_vars]
-   │       │   ├─ dgVolumeRhsHex3D   (STUB)     [advect.f::advect_volInt]
-   │       │   └─ dgSurfaceRhsHex3D  (STUB)     [advect.f::advect_interface, riemann.f]
+   │       │   ├─ dgVolumeRhsHex3D  (KEP)       [advect.f::advect_volInt, getFlux_KEP]
+   │       │   ├─ dgSurfaceFluxHex3D            [advect.f::advect_interface, fluxLF.f::eval_lmf, riemann.f]
+   │       │   └─ dgSurfaceLiftHex3D            [the area/bm1 lift inside advect_interface]
    │       ├─ dgSSPRKStage                      [SSPRK3 stage update]
    │       └─ dgPrimitives                      [compvar.f::eval_dependent_vars]
    │   └─ copyToFluid (u, p into nrs->fluid for checkpoints)
@@ -65,7 +67,9 @@ nekRS time loop (solver = none, so nekRS only advances time and writes checkpoin
 
 **Sign convention:** the Fortran `rkRHS` is −dU/dt. `o_rhs` in nekRS is +dU/dt. Keep this in mind when you compare dumps.
 
-**While the two RHS kernels are stubs, `o_rhs` = 0 and the solution never changes.** u, p and T stay at the initial condition for the whole run. In particular p stays at p0 = 1 bar, and the velocity keeps its initial urms (120.5 m/s for compHIT) while the Nek5000 run decays to 58.7 m/s by t = 4.5 τ0.
+**The RHS is inviscid only.** `viscous = yes` prints a warning and runs inviscid until BR1 (T-31) and the transport properties (T-32) land. So a nekRS run matches a Nek5000 run with `ifviscous = .false.`, not the viscous compHIT reference. Setup aborts on any boundary face (fully periodic meshes only, until T-36).
+
+**Surface term in two kernels.** `dgSurfaceFluxHex3D` runs once per face node and writes the numerical-flux correction `−(F* − F_M)·WSJ·IJW` (= Fortran `(F* − F_L)·area/bm1` with the sign flip) to `o_faceFlux`. `dgSurfaceLiftHex3D` runs per element; thread (i,j) owns column k, so it adds the faces touching each node without atomics or a race.
 
 ## 3. Fortran routine → nekRS map
 
@@ -117,38 +121,40 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
 | `sum_neighbor_vars`, `sum_neighbor` (`full2face` + `gs_op add`) | `dgTraceGather` + `oogs::startFinish(o_faceP, ...)` in `computeRhs` | ported | gives M + P like the `*pi` arrays; the neighbour is `faceP − faceM`. Periodic pairing check: T-13 |
-| `eval_lmf` (λ_max on faces, `gs_op max`) | `dgWaveSpeed` (pointwise \|u\|+a only) | partial | no face max yet; part of T-19. See B-01 |
-| `compute_flux` | — | todo | inside the T-18/T-19 kernels |
+| `eval_lmf` (λ_max on faces, `gs_op max`) | inside `dgSurfaceFluxHex3D` | ported | λ = max(a + \|u·n\|) over M and P, computed pointwise from both traces, so no `gs_op max` is needed. `dgWaveSpeed` is the separate \|u\|+a reduction for the CFL |
+| `compute_flux` | `physFlux` (full LLF) / `kepFluxAdd` (partial LLF) in `dgComp.okl` | ported | `fullInterfaceLLF` picks ½(F_M + F_P) instead of the KEP average |
 
 ### advect.f — inviscid volume and interface terms
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
 | `advect` | `computeRhs` | ported | orchestration only |
-| `advect_volInt` | `dgVolumeRhsHex3D` | **stub** (rhs = 0) | T-18, main performance kernel |
-| `getFlux_KEP` | — | todo | T-18 (`volumeFlux = kep`) |
-| `getFlux_EC`, `ecAvg`, `ecLog` | — | todo | T-18 (`volumeFlux = ec`) |
-| `advect_interface` (LLF) | `dgSurfaceRhsHex3D` | **stub** (adds nothing) | T-19 |
+| `advect_volInt` | `dgVolumeRhsHex3D` | ported (KEP) | T-18. Primitives in shared memory, thread (i,j) loops over k, Σ_l 2 D_il F#(i,l)·(metrics at i) in r, s, t; writes rhs = −rkRHS |
+| `getFlux_KEP` | `kepFluxAdd` | ported | T-18 |
+| `getFlux_EC`, `ecAvg`, `ecLog` | — | todo | T-49; setup aborts on `volumeFlux = ec` |
+| `advect_interface` (LLF) | `dgSurfaceFluxHex3D` (`riemannSolver = llf`) + `dgSurfaceLiftHex3D` | ported | T-19. Dissipation −½λ(U_P − U_M) |
 
 ### riemann.f — HLL / HLLC
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `advect_interface_riemann` | `dgSurfaceRhsHex3D` (HLLC branch) | todo | T-19; setup aborts unless `riemannSolver = llf` |
-| `riemann_flux`, `phys_flux`, `cons_state`, `flux_hll`, `flux_hllc` | — | todo | T-19, as device functions in `dgComp.okl` |
+| `advect_interface_riemann` | `dgSurfaceFluxHex3D` (`riemannSolver = hll, hllc, hllcBlend`) + `dgSurfaceLiftHex3D` | ported | T-19. L = own trace, R = `faceP − faceM`, Davis wave speeds |
+| `riemann_flux` (incl. the HLLC/HLL pressure-jump blend) | `dgSurfaceFluxHex3D` | ported | blend weights from `blendSw0/blendSw1/blendSwRho` |
+| `phys_flux`, `flux_hll`, `flux_hllc` | `physFlux`, `fluxHLL`, `fluxHLLC` | ported | |
+| `cons_state` | — | n/a | the conserved states are read directly from `faceM`/`faceP` |
 
 ### dgrhs.f, compf.f — RHS assembly and source term
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `getdgrhs` | `computeRhs` | partial | inviscid stubs only; viscous, AV and source hooks are TODO comments |
+| `getdgrhs` | `computeRhs` | partial | inviscid part ported; viscous, AV and source hooks are TODO comments |
 | `compf` (ω̇ in the species RHS, unsplit) | — | todo | T-40 (M4) |
 
 ### compbc.f — boundary conditions
 
 | Fortran | nekRS | status | notes / task |
 |---|---|---|---|
-| `compbc`, `compbc_setup`, `compbc_flux` | `EToB > 0` branch in `dgSurfaceRhsHex3D` | todo | T-36 (M3). Not needed for periodic HIT |
+| `compbc`, `compbc_setup`, `compbc_flux` | (planned: `EToB > 0` branch in `dgSurfaceFluxHex3D`) | todo | T-36 (M3). Not needed for periodic HIT; setup aborts if the mesh has any boundary face |
 | `compbc_visc` | — | todo | T-36 with T-31 |
 
 ### compcfl.f — time-step limits
@@ -189,7 +195,7 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
 |---|---|
 | `dg_setup`, `dg_setup2`, `dg_hndlx` | `oogs::setup` on `mesh->globalFaceIds` (`setupImpl`) |
 | `full2face` | `mesh->o_vmapM` (`dgTraceGather`) |
-| `gs_op(..., add)` / `gs_op(..., max)` | `oogs::startFinish(..., ogsAdd)`; max not used yet |
+| `gs_op(..., add)` / `gs_op(..., max)` | `oogs::startFinish(..., ogsAdd)`; max is not needed (λ is taken pointwise from M and P) |
 | `rxm1..tzm1`, `jacm1`, `jacmi`, `bm1` | `mesh->o_vgeo` (`p_RXID..p_TZID`, `p_JID`, `p_IJWID`, `p_JWID`), `mesh->o_LMM` |
 | `area`, `unx/uny/unz` | `mesh->o_sgeo` (`p_NXID..`, `p_WSJID`) |
 | `dxm1` | `mesh->o_D` |
@@ -221,9 +227,9 @@ Names without a file are in `dgComp.cpp` (host) or `kernels/dgComp.okl` (kernels
   - The nekRS startup prints urms0, lambda0 and tau0. The first `stat_ref.dat` row has the full set.
   - For compHIT the expected values are urms0 = 120.50, lambda0 = 1.3367e-5 and tau0 = 1.109e-7.
   - p = p0 and T = T0 are uniform in both codes at t = 0.
-- **Later times cannot match until T-18 and T-19 land.**
-  - The nekRS field stays frozen at the initial condition.
-  - In Nek5000, urms decays (to 58.7 m/s at 4.5 τ0), and prms and Trms grow from 0.
-- **Once the fluxes are in, use the harness (T-22).**
-  - Dump one step of CompNek5000 and compare it field by field.
-  - Mind the rkRHS sign flip (§2).
+- **The inviscid fluxes are in (T-18, T-19), the viscous terms are not.**
+  - Compare against a Nek5000 run with `ifviscous = .false.`, the same `ifVolEC = .false.` (KEP), the same `uparam(5)` / `riemannSolver`, `ifIntLLFfull` / `fullInterfaceLLF`, and the same fixed dt.
+  - The viscous reference (urms 58.7 m/s at 4.5 τ0) cannot match until T-31 and T-32 land. An inviscid run decays more slowly; only numerical dissipation removes energy.
+- **Step-0 RHS is the sharpest check (T-22).**
+  - Dump `rkRHS` from CompNek5000 after the first `getdgrhs` and `o_rhs` from nekRS after the first `computeRhs`; they should agree to round-off with the sign flipped (§2).
+  - Then compare one full SSPRK3 step field by field.

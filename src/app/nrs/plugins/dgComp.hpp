@@ -23,8 +23,11 @@
 //   gasConstant = 287.0       # perfectGas only, specific gas constant R [J/(kg K)]
 //   nspec = 2                 # nasa only (required): number of species
 //   npa = 5                   # nasa only: NASA polynomial coefficients per species
-//   riemannSolver = llf       # llf | hllc      (CompNek5000 userparam05 = 0 | 2)
-//   volumeFlux = kep          # kep | ec        (ifVolEC)
+//   riemannSolver = llf       # llf | hll | hllc | hllcBlend  (CompNek5000 userparam05 = 0..3)
+//   blendSw0 = 0.01           # hllcBlend: |dp|/(pL+pR) where HLL starts  (userparam06)
+//   blendSw1 = 0.1            # hllcBlend: ... where it is pure HLL, <= blendSw0 means 10 blendSw0 (userparam07)
+//   blendSwRho = 0.1          # hllcBlend: density-jump damping at subsonic faces (userparam08)
+//   volumeFlux = kep          # kep | ec        (ifVolEC; ec not implemented yet)
 //   viscous = yes             # ifviscous
 //   reacting = no             # ifforces
 //   splitChemistry = no       # ifsplitchem
